@@ -674,18 +674,20 @@ mod tests {
     #[test]
     fn native_claude_code_keeps_its_identity_and_body() {
         for version in ["2.1.280", "2.1.290", "2.1.312", "2.1.321", "2.1.322"] {
-            check_native_claude_code_identity(version);
+            check_native_claude_code_identity(version, "cli");
         }
+        // Background sessions are native too and keep their own x-app.
+        check_native_claude_code_identity("2.1.321", "cli-bg");
     }
 
-    fn check_native_claude_code_identity(version: &str) {
+    fn check_native_claude_code_identity(version: &str, x_app: &'static str) {
         let session = "8f14e45f-ceea-4672-9b8e-3c1c1a0e4a1d";
         let mut incoming = HeaderMap::new();
         incoming.insert(
             "user-agent",
             HeaderValue::from_str(&format!("claude-cli/{version} (external, cli)")).unwrap(),
         );
-        incoming.insert("x-app", HeaderValue::from_static("cli"));
+        incoming.insert("x-app", HeaderValue::from_static(x_app));
         incoming.insert(
             "anthropic-beta",
             HeaderValue::from_static(
@@ -713,7 +715,8 @@ mod tests {
         });
         let (_, headers, hook) = run(&incoming, &mut body);
 
-        assert!(hook.native);
+        assert!(hook.native, "{version} x-app={x_app}");
+        assert_eq!(headers["x-app"], x_app);
         assert_eq!(
             headers["user-agent"].to_str().unwrap(),
             format!("claude-cli/{version} (external, cli)")

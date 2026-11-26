@@ -813,8 +813,12 @@ pub(crate) struct NativeDetection {
 
 const NATIVE_ENTRYPOINTS: &[&str] = &["cli", "sdk-cli", "sdk-ts", "claude-vscode"];
 
+/// `x-app` values native Claude Code sends: `cli` for interactive sessions
+/// and `cli-bg` for background sessions (CLIProxyAPI 6876a2eb4, issue #7412).
+const NATIVE_X_APPS: &[&str] = &["cli", "cli-bg"];
+
 /// Detect a native Claude Code client (`helps/claude_client_detection.go`):
-/// `x-app: cli`, a `claude-cli/…` UA from a native entrypoint and the
+/// `x-app: cli` (or `cli-bg`), a `claude-cli/…` UA from a native entrypoint and the
 /// `claude-code-20250219` beta, plus either the 2.1.220+ JSON
 /// `metadata.user_id` shape or a count_tokens call.
 pub(crate) fn detect_native(
@@ -828,7 +832,11 @@ pub(crate) fn detect_native(
     let native_entrypoint = entrypoint
         .as_deref()
         .is_some_and(|e| NATIVE_ENTRYPOINTS.contains(&e));
-    let x_app = header_str(headers, "x-app").is_some_and(|v| v.eq_ignore_ascii_case("cli"));
+    let x_app = header_str(headers, "x-app").is_some_and(|v| {
+        NATIVE_X_APPS
+            .iter()
+            .any(|native| v.eq_ignore_ascii_case(native))
+    });
     let beta = headers
         .get_all("anthropic-beta")
         .iter()
@@ -1433,6 +1441,19 @@ mod tests {
         assert!(!detect_native(&headers, &json!({}), false).confirmed);
         // …but count_tokens never carries metadata.
         assert!(detect_native(&headers, &json!({}), true).confirmed);
+        // Background sessions keep their native identity…
+        let mut background = headers.clone();
+        background.insert("x-app", HeaderValue::from_static("cli-bg"));
+        assert!(detect_native(&background, &body, false).confirmed);
+        // …while any other x-app value is not Claude Code.
+        for other in ["web", "cli-bgx", "sdk", ""] {
+            let mut foreign = headers.clone();
+            foreign.insert("x-app", HeaderValue::from_str(other).unwrap());
+            assert!(
+                !detect_native(&foreign, &body, false).confirmed,
+                "{other:?}"
+            );
+        }
         // A spoofed UA alone is never confirmed.
         let mut spoof = HeaderMap::new();
         spoof.insert(
