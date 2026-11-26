@@ -647,17 +647,19 @@ async fn handle_buffered_compat(
         } else {
             health_outcome_from_status(metadata.status)
         };
-        let refusal = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|body| {
-                crate::provider::anthropic::claude_code::errors::account_refusal(
-                    metadata.status,
-                    &body,
-                )
-            });
+        let parsed_body = serde_json::from_slice::<Value>(&body).ok();
+        let refusal = parsed_body.as_ref().and_then(|body| {
+            crate::provider::anthropic::claude_code::errors::account_refusal(metadata.status, body)
+        });
+        let suspension = parsed_body.as_ref().and_then(|body| {
+            crate::provider::google::account_suspension::tos_violation(metadata.status, body)
+        });
         let tag = |mut response: Response| {
             if let Some(failure) = refusal {
                 response.extensions_mut().insert(failure);
+            }
+            if let Some(violation) = suspension.clone() {
+                response.extensions_mut().insert(violation);
             }
             if entitlement {
                 response.extensions_mut().insert(super::EntitlementRefusal);

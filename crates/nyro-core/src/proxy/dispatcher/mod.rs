@@ -319,13 +319,19 @@ impl QuotaSkips {
 }
 
 /// Tag an upstream error response with request-scoped refusal evidence:
-/// Anthropic entitlement/account refusals and Google 429 classification.
+/// Anthropic entitlement/account refusals, Google account suspension and
+/// Google 429 classification.
 pub(super) fn mark_upstream_error(
     response: &mut Response,
     status: u16,
     body: &Value,
     antigravity_header_delay: Option<u64>,
 ) {
+    if let Some(violation) =
+        crate::provider::google::account_suspension::tos_violation(status, body)
+    {
+        response.extensions_mut().insert(violation);
+    }
     if let Some(failure) =
         crate::provider::anthropic::claude_code::errors::account_refusal(status, body)
     {
@@ -361,6 +367,41 @@ pub(super) fn mark_upstream_error(
             response.extensions_mut().insert(LocalHealthNeutral);
         }
         response.extensions_mut().insert(evidence);
+    }
+}
+
+/// A suspended Google account fails every request until an appeal succeeds:
+/// persist it as a terminal credential error so routing skips the provider
+/// instead of re-sending each request to the banned account first. The
+/// current request still fails over through the credential-rejection path.
+async fn suspend_google_subscription_credential(
+    gw: &Gateway,
+    provider: &Provider,
+    sent_access_token: &str,
+    violation: &crate::provider::google::account_suspension::TosViolation,
+    request_id: &str,
+) {
+    match gw
+        .admin()
+        .suspend_provider_credential(provider, sent_access_token, &violation.credential_error())
+        .await
+    {
+        Ok(true) => tracing::warn!(
+            request_id = %request_id,
+            provider_id = %provider.id,
+            "Google suspended the subscription account (TOS_VIOLATION); routing is disabled until it is reauthorized"
+        ),
+        Ok(false) => tracing::debug!(
+            request_id = %request_id,
+            provider_id = %provider.id,
+            "Google TOS_VIOLATION for a superseded credential generation; not persisted"
+        ),
+        Err(error) => tracing::warn!(
+            request_id = %request_id,
+            provider_id = %provider.id,
+            error = %error,
+            "could not persist the Google TOS_VIOLATION credential suspension"
+        ),
     }
 }
 
@@ -2492,6 +2533,22 @@ async fn dispatch_pipeline_inner(
                             ctx,
                         )));
             let status = response.status().as_u16();
+            if pool_account.is_none()
+                && crate::provider::google::is_subscription_channel(&provider)
+                && let Some(violation) = response
+                    .extensions()
+                    .get::<crate::provider::google::account_suspension::TosViolation>()
+                    .cloned()
+            {
+                suspend_google_subscription_credential(
+                    &gw,
+                    &provider,
+                    &provider_runtime.access_token,
+                    &violation,
+                    &ctx.request_id,
+                )
+                .await;
+            }
             // An entitlement refusal says nothing about the account's quota
             // windows; re-reading usage would only add load to a 429-prone
             // usage endpoint.

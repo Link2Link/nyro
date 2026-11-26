@@ -424,6 +424,140 @@ fn antigravity_retry_after_reaches_client_and_scheduler_on_both_request_paths() 
     Ok(())
 }
 
+#[test]
+fn google_tos_violation_disables_the_credential_until_reauthorized() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (channel, stream) in [
+        ("antigravity", false),
+        ("antigravity", true),
+        ("gemini-cli", true),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let gw = offline_gateway(channel, &base)?;
+        runtime()?.block_on(async move {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let count = hits.clone();
+            let app = Router::new().fallback(move |uri: Uri| {
+                let count = count.clone();
+                async move {
+                    if !uri.path().starts_with("/v1internal:") {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    // Verbatim Code Assist suspension shape; the free-text
+                    // message and appeal query can identify the account.
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": {
+                            "code": 403,
+                            "message": "This service has been disabled in this account (account-marker@example.com) for violation of Terms of Service.",
+                            "status": "PERMISSION_DENIED",
+                            "details": [{
+                                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                "reason": "TOS_VIOLATION",
+                                "domain": "cloudcode-pa.googleapis.com",
+                                "metadata": {
+                                    "appeal_url": "https://forms.gle/fixture-appeal?authuser=account-marker",
+                                    "appeal_url_link_text": "Submit Appeal"
+                                }
+                            }]
+                        }})),
+                    )
+                        .into_response()
+                }
+            });
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let _server = AbortOnDrop(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            bind_fixture_credential(&gw).await?;
+
+            // The suspended account's own 403 still reaches the client.
+            let rejected = fixture_chat(&gw, stream).await?;
+            assert_eq!(rejected.status(), StatusCode::FORBIDDEN, "{channel} stream={stream}");
+            to_bytes(rejected.into_body(), 1 << 20).await?;
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            let row = gw
+                .storage
+                .oauth_credentials()
+                .get("local-subscription")
+                .await?
+                .expect("credential row");
+            assert_eq!(row.status, "error", "{channel} stream={stream}");
+            let error = row.last_error.unwrap_or_default();
+            assert!(
+                error.contains("TOS_VIOLATION")
+                    && error.contains("https://forms.gle/fixture-appeal,")
+                    && error.contains("reauthorize"),
+                "{error}"
+            );
+            assert!(!error.contains("account-marker"), "{error}");
+
+            // Routing now skips the banned account instead of re-sending to it.
+            let skipped = fixture_chat(&gw, stream).await?;
+            assert_eq!(skipped.status(), StatusCode::BAD_GATEWAY);
+            to_bytes(skipped.into_body(), 1 << 20).await?;
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+            // Reauthorization replaces the credential and restores routing.
+            bind_fixture_credential(&gw).await?;
+            let retried = fixture_chat(&gw, stream).await?;
+            assert_eq!(retried.status(), StatusCode::FORBIDDEN);
+            to_bytes(retried.into_body(), 1 << 20).await?;
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            anyhow::Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn plain_google_403_keeps_the_credential_routable() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let gw = offline_gateway("antigravity", &base)?;
+    runtime()?.block_on(async move {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let app = Router::new().fallback(move || {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
+                        "message": "The caller does not have permission"}})),
+                )
+                    .into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        bind_fixture_credential(&gw).await?;
+        for _ in 0..2 {
+            let response = fixture_chat(&gw, true).await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            to_bytes(response.into_body(), 1 << 20).await?;
+        }
+        // An unclassified 403 stays request-scoped: no persisted suspension.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let row = gw
+            .storage
+            .oauth_credentials()
+            .get("local-subscription")
+            .await?
+            .expect("credential row");
+        assert_eq!(row.status, "connected");
+        anyhow::Ok(())
+    })
+}
+
 fn non_stream_anthropic_subscription(channel: &str) -> anyhow::Result<()> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;

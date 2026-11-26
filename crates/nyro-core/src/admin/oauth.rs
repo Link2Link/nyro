@@ -1260,6 +1260,44 @@ impl AdminService {
         self.clear_provider_quota_identity(&provider.id).await?;
         Ok(provider)
     }
+
+    /// Persist an upstream account suspension (for example Google
+    /// `TOS_VIOLATION`) as a terminal credential error for a single-account
+    /// OAuth provider. Fenced to the generation that was actually sent: the
+    /// stored access token must still match `sent_access_token`, so a newer
+    /// bind or refresh is never disabled by a stale response. Returns whether
+    /// the credential was marked. `resolve_provider_runtime` then skips the
+    /// provider until reauthorization replaces the credential.
+    pub(crate) async fn suspend_provider_credential(
+        &self,
+        provider: &Provider,
+        sent_access_token: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let sent_access_token = sent_access_token.trim();
+        if sent_access_token.is_empty() || crate::provider::account_pool::supports_pool(provider) {
+            return Ok(false);
+        }
+        let store = self.gw.storage.oauth_credentials();
+        let Some(current) = store.get(&provider.id).await? else {
+            return Ok(false);
+        };
+        if current.status != "connected" || current.access_token.trim() != sent_access_token {
+            return Ok(false);
+        }
+        // The refresh lease is the only connected -> error transition the
+        // stores expose; holding it also excludes a concurrent refresh.
+        let Some(lease) = store
+            .try_begin_refresh(&provider.id, current.status_version)
+            .await?
+        else {
+            return Ok(false);
+        };
+        store
+            .fail_refresh_with_policy(&provider.id, lease.status_version, reason, true, None)
+            .await
+    }
+
     pub(crate) async fn resolve_provider_runtime(
         &self,
         provider: &Provider,

@@ -1,5 +1,6 @@
 //! Google vendor (Gemini direct API + Google subscription channels).
 
+pub(crate) mod account_suspension;
 pub(crate) mod antigravity;
 pub(crate) mod gemini_cli;
 
@@ -372,7 +373,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(GoogleGeminiCliEx
 
 /// True when the provider rides a Google subscription channel (antigravity
 /// or gemini-cli) on the Code Assist v1internal surface.
-fn is_subscription_channel(provider: &crate::db::models::Provider) -> bool {
+pub(crate) fn is_subscription_channel(provider: &crate::db::models::Provider) -> bool {
     antigravity::is_google_antigravity(provider) || gemini_cli::is_google_gemini_cli(provider)
 }
 
