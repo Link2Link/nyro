@@ -9,7 +9,8 @@ use crate::storage::provider_usage::{ProviderQuotaModelUsage, ProviderQuotaUsage
 use super::*;
 
 /// Retained provider usage at current API-equivalent rates. Coding-plan periods
-/// follow the captured upstream quota window; Sub2API uses a UTC calendar month.
+/// follow the captured upstream quota window; local accounting (Sub2API and
+/// the Anthropic API-key default channel) uses a UTC calendar month.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderApiPriceStats {
     pub all_time: AccountUsageTotals,
@@ -18,7 +19,7 @@ pub struct ProviderApiPriceStats {
     /// Period bounds [start, end) in UTC epoch milliseconds.
     pub period_start: Option<i64>,
     pub period_end: Option<i64>,
-    /// `weekly_limit` | `five_hour` | `monthly` for quota; `calendar_month` for Sub2API.
+    /// `weekly_limit` | `five_hour` | `monthly` for quota; `calendar_month` for local accounting.
     pub period_tier: Option<String>,
     /// Finite observed utilization (0..=100) of that same identified cycle.
     pub used_percent: Option<f64>,
@@ -422,7 +423,8 @@ fn bucket_period(
 }
 
 impl AdminService {
-    pub(super) async fn sub2api_api_price_stats(
+    /// Local retained-log accounting (`sub2api` / `anthropic_api`).
+    pub(super) async fn local_api_price_stats(
         &self,
         provider: Provider,
         now: DateTime<Utc>,

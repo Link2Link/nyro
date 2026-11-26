@@ -6,7 +6,7 @@ import { LocaleProvider } from "../lib/i18n";
 import type { AccountPoolView, PoolQuotaWindow, ProviderAccountView } from "../lib/devin-account-pool";
 import type { Provider, ProviderApiPriceStats, ProviderUsage, QuotaBucket } from "../lib/types";
 import { GroupUsageSummary, ProviderUsageFooter } from "./provider-usage";
-import { Sub2ApiUsageSummary } from "./sub2api-usage-summary";
+import { LocalUsageSummary } from "./local-usage-summary";
 
 const now = Date.parse("2030-01-01T00:00:00Z");
 const provider: Provider = {
@@ -264,7 +264,8 @@ const sub2apiUsage: ProviderUsage = { ...base, provider_id: sub2apiProvider.id, 
 test("Sub2API cards show retained attempts, tokens, and two amounts without upstream quota or projections", () => {
   const html = render(sub2apiUsage, undefined, sub2apiProvider);
   match(html, />Sub2API Usage</);
-  match(html, /data-sub2api-scope="all_time"[^]*>All time<[^]*data-sub2api-scope="calendar_month"[^]*>This month</);
+  match(html, /data-local-usage="sub2api"/);
+  match(html, /data-local-usage-scope="all_time"[^]*>All time<[^]*data-local-usage-scope="calendar_month"[^]*>This month</);
   match(html, /UTC calendar month/);
   match(html, /not Sub2API billing/);
   equal(priceValues(html), "2,1.00M,$30.00,1,100.0K,$3.00");
@@ -279,16 +280,16 @@ test("Sub2API cards show retained attempts, tokens, and two amounts without upst
 });
 
 test("Sub2API distinguishes expired months, unused months and unpriced attempts", () => {
-  const expired = renderToStaticMarkup(<Sub2ApiUsageSummary stats={sub2apiPrice} now={sub2apiPrice.period_end!} loading={false} locale="zh-CN" />);
+  const expired = renderToStaticMarkup(<LocalUsageSummary kind="sub2api" stats={sub2apiPrice} now={sub2apiPrice.period_end!} loading={false} locale="zh-CN" />);
   match(expired, />累计<[^]*>本月</);
   match(expired, /UTC 自然月|本月统计尚未更新/);
   equal(priceValues(expired), "2,1.00M,$30.00,—,—,—");
 
   const zero = { total_tokens: 0, request_count: 0, equivalent_costs: [], unpriced_request_count: 0 };
-  const empty = renderToStaticMarkup(<Sub2ApiUsageSummary stats={{ ...sub2apiPrice, all_time: zero, period: zero }} now={now} loading={false} />);
+  const empty = renderToStaticMarkup(<LocalUsageSummary kind="sub2api" stats={{ ...sub2apiPrice, all_time: zero, period: zero }} now={now} loading={false} />);
   equal(priceValues(empty), "0,0,$0.00,0,0,$0.00");
   const unpriced = { ...sub2apiPrice.period!, equivalent_costs: [], unpriced_request_count: 1 };
-  const unknownPrice = renderToStaticMarkup(<Sub2ApiUsageSummary stats={{ ...sub2apiPrice, period: unpriced }} now={now} loading={false} />);
+  const unknownPrice = renderToStaticMarkup(<LocalUsageSummary kind="sub2api" stats={{ ...sub2apiPrice, period: unpriced }} now={now} loading={false} />);
   equal(priceValues(unknownPrice), "2,1.00M,$30.00,1,100.0K,—");
   match(unknownPrice, /1 attempts unpriced and excluded/);
 });
@@ -301,6 +302,36 @@ test("folded quota summaries do not query Sub2API local accounting", () => {
     </LocaleProvider></QueryClientProvider>);
     equal(html, "");
     equal(client.getQueryCache().find({ queryKey: ["provider-usage", sub2apiProvider.id] }), undefined);
+  } finally { client.clear(); }
+});
+
+const anthropicProvider: Provider = { ...provider, id: "anthropic", name: "Anthropic", vendor: "anthropic", preset_key: "anthropic",
+  channel: "default", protocol: "anthropic-messages", auth_mode: "apikey", base_url: "https://api.anthropic.com" };
+const anthropicUsage: ProviderUsage = { ...sub2apiUsage, provider_id: anthropicProvider.id, kind: "anthropic_api" };
+
+test("Anthropic default-channel cards show the same local totals without upstream quota", () => {
+  const html = render(anthropicUsage, undefined, anthropicProvider);
+  match(html, />Anthropic API Usage</);
+  match(html, /data-local-usage="anthropic_api"/);
+  match(html, /data-local-usage-scope="all_time"[^]*>All time<[^]*data-local-usage-scope="calendar_month"[^]*>This month</);
+  match(html, /not upstream billing/);
+  doesNotMatch(html, /Sub2API/);
+  equal(priceValues(html), "2,1.00M,$30.00,1,100.0K,$3.00");
+  doesNotMatch(html, /role="progressbar"|Quota reset|Estimated cycle API capacity|No usage data/);
+  // A cached report from another accounting mode is never shown as this one.
+  equal(priceValues(render({ ...sub2apiUsage, provider_id: anthropicProvider.id }, undefined, anthropicProvider)), "—,—,—,—,—,—");
+  equal(priceValues(render({ ...priceUsage, provider_id: anthropicProvider.id }, undefined, anthropicProvider)), "—,—,—,—,—,—");
+
+  const zh = renderToStaticMarkup(<LocalUsageSummary kind="anthropic_api" stats={anthropicUsage.api_price} now={now} loading={false} locale="zh-CN" />);
+  match(zh, />累计<[^]*>本月</);
+  match(zh, /非上游实际账单/);
+
+  const client = new QueryClient();
+  try {
+    equal(renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
+      <GroupUsageSummary providers={[anthropicProvider]} />
+    </LocaleProvider></QueryClientProvider>), "");
+    equal(client.getQueryCache().find({ queryKey: ["provider-usage", anthropicProvider.id] }), undefined);
   } finally { client.clear(); }
 });
 

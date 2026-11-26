@@ -46,18 +46,41 @@ export function providerUsagePause(
   };
 }
 
-/** Sub2API has local accounting, not an upstream quota observation. */
-export function isSub2ApiUsageProvider(provider: Pick<Provider, "vendor" | "preset_key" | "channel">): boolean {
-  return provider.channel?.trim().toLowerCase() === "sub2api"
-    && ![provider.vendor, provider.preset_key].some(isNyroGatewayPreset);
+type UsageIdentity = Pick<Provider, "base_url" | "vendor" | "preset_key" | "channel" | "auth_mode">;
+
+/** Usage computed from this gateway's retained logs, not an upstream quota observation. */
+export type LocalUsageKind = "sub2api" | "anthropic_api";
+
+export function isLocalUsageKind(kind: string | null | undefined): kind is LocalUsageKind {
+  return kind === "sub2api" || kind === "anthropic_api";
+}
+
+/** Anthropic API-key default channel by identity; a blank legacy channel is `default`. */
+function isAnthropicDefaultChannel(provider: Pick<Provider, "vendor" | "preset_key" | "channel">): boolean {
+  const identities = [provider.vendor, provider.preset_key]
+    .map((value) => value?.trim().toLowerCase())
+    .filter((value): value is string => Boolean(value));
+  const channel = provider.channel?.trim().toLowerCase();
+  return identities.length > 0 && identities.every((value) => value === "anthropic")
+    && (!channel || channel === "default");
+}
+
+/** Local accounting kind. Mirrors nyro-core `admin::usage::LocalUsageAccounting::detect`. */
+export function localUsageKind(provider: UsageIdentity): LocalUsageKind | null {
+  if ([provider.vendor, provider.preset_key].some(isNyroGatewayPreset)) return null;
+  if (provider.channel?.trim().toLowerCase() === "sub2api") return "sub2api";
+  // A vendor quota backend selected by Base URL keeps its upstream view.
+  if (isAnthropicDefaultChannel(provider) && !upstreamUsageSupported(provider)) return "anthropic_api";
+  return null;
 }
 
 /** Providers with an upstream usage-query backend. Mirrors
  * nyro-core `admin::usage::UsageBackend::detect`. */
-export function providerUsageSupported(
-  provider: Pick<Provider, "base_url" | "vendor" | "preset_key" | "channel" | "auth_mode">,
-): boolean {
-  if (isSub2ApiUsageProvider(provider)) return false;
+export function providerUsageSupported(provider: UsageIdentity): boolean {
+  return localUsageKind(provider) === null && upstreamUsageSupported(provider);
+}
+
+function upstreamUsageSupported(provider: UsageIdentity): boolean {
   const url = provider.base_url.toLowerCase();
   const vendor = (provider.vendor ?? provider.preset_key ?? "").toLowerCase();
   const isCodexOAuth =
@@ -135,6 +158,7 @@ export function providerApiPriceSupported(kind: string | undefined): boolean {
 
 export function providerUsageTitle(kind: string | undefined, isZh: boolean): string {
   if (kind === "sub2api") return isZh ? "Sub2API 用量" : "Sub2API Usage";
+  if (kind === "anthropic_api") return isZh ? "Anthropic API 用量" : "Anthropic API Usage";
   if (kind?.endsWith("_balance")) return isZh ? "账户余额" : "Balance";
   if (kind === "openai_codex") return isZh ? "ChatGPT Codex 用量" : "ChatGPT Codex Usage";
   if (kind === "devin_plan") return isZh ? "Devin 用量" : "Devin Usage";

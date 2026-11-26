@@ -1169,7 +1169,7 @@ async fn sub2api_retained_prices_follow_utc_month_and_shared_cutoff() -> anyhow:
     }
 
     let stats_at = |at| {
-        admin.sub2api_api_price_stats(
+        admin.local_api_price_stats(
             provider.clone(),
             DateTime::from_timestamp_millis(at).unwrap(),
         )
@@ -1379,5 +1379,181 @@ async fn sub2api_usage_is_admin_only_and_independent_of_quota_state() -> anyhow:
         Some(old_snapshot)
     );
     assert!(gw.usage_snapshots.fresh(&disabled.id, max_age).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn anthropic_default_channel_uses_local_accounting_without_upstream_quota()
+-> anyhow::Result<()> {
+    use crate::config::GatewayConfig;
+    use crate::storage::{SqliteStorage, Storage};
+    use chrono::Datelike;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let storage = SqliteStorage::from_config(&config).await?;
+    let mut providers = Vec::new();
+    for spec in [
+        json!({
+            "name": "Anthropic", "vendor": "anthropic", "preset_key": "anthropic",
+            "channel": "default", "protocol": "anthropic-messages",
+            "base_url": "https://api.anthropic.com", "api_key": ""
+        }),
+        // Legacy rows may predate the channel field; a relay URL stays local.
+        json!({
+            "name": "Legacy Anthropic relay", "vendor": " Anthropic ",
+            "protocol": "anthropic-messages",
+            "base_url": "https://relay.example.invalid", "api_key": ""
+        }),
+        // A vendor quota URL keeps its upstream backend instead of local totals.
+        json!({
+            "name": "Anthropic-compatible GLM", "vendor": "anthropic", "preset_key": "anthropic",
+            "channel": "default", "protocol": "anthropic-messages",
+            "base_url": "https://open.bigmodel.cn/api/anthropic", "api_key": ""
+        }),
+        // The subscription OAuth channel and mixed identities never match.
+        json!({
+            "name": "Claude Code", "vendor": "anthropic", "preset_key": "anthropic",
+            "channel": "claude-code", "protocol": "anthropic-messages",
+            "base_url": "https://api.anthropic.com", "api_key": "", "auth_mode": "oauth"
+        }),
+        json!({
+            "name": "Custom Anthropic", "vendor": "anthropic", "preset_key": "custom",
+            "channel": "default", "protocol": "anthropic-messages",
+            "base_url": "https://relay.example.invalid", "api_key": ""
+        }),
+    ] {
+        providers.push(
+            storage
+                .providers()
+                .create(serde_json::from_value(spec)?)
+                .await?,
+        );
+    }
+    let [official, legacy, glm, claude_code, custom] = providers.as_slice() else {
+        unreachable!()
+    };
+
+    let today = Utc::now().date_naive();
+    let month_start = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    for (index, at) in [month_start - 1, month_start].into_iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO request_logs (id, provider_id, client_model, upstream_model, created_at,
+             input_tokens, output_tokens, cache_read_tokens, client_request_id, attempt_index,
+             outcome_version, attempt_outcome, upstream_status_code)
+             VALUES (?, ?, 'claude', 'claude-wire', ?, 1000000, 100000, 0, ?, 0, 1,
+             'completed', 200)",
+        )
+        .bind(format!("anthropic-attempt-{index}"))
+        .bind(&official.id)
+        .bind(at)
+        .bind(format!("anthropic-request-{index}"))
+        .execute(storage.pool())
+        .await?;
+    }
+
+    let (gw, _) = Gateway::from_storage(config, Arc::new(storage.clone())).await?;
+    let admin = gw.admin();
+    admin
+        .set_token_price(TokenPriceInput {
+            provider_id: official.id.clone(),
+            model: "claude-wire".into(),
+            price: Some(TokenPriceRates {
+                currency: "USD".into(),
+                input_rate: 3.0,
+                output_rate: 15.0,
+                cache_read_rate: Some(0.3),
+            }),
+        })
+        .await?;
+    admin
+        .create_model(serde_json::from_value(json!({
+            "name": "anthropic-model", "target_provider": official.id,
+            "target_model": "claude-wire", "enable_auth": false
+        }))?)
+        .await?;
+    let old_scheduling = gw.quota_registry.snapshot(&official.id);
+
+    let costs = |totals: &AccountUsageTotals| {
+        totals
+            .equivalent_costs
+            .iter()
+            .map(|cost| {
+                (
+                    cost.currency.clone(),
+                    cost.total_cost,
+                    cost.priced_request_count,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for provider in [official, legacy] {
+        let usage = admin.get_provider_usage(&provider.id).await?;
+        assert_eq!(usage.provider_id, provider.id);
+        assert_eq!(
+            (usage.kind.as_str(), usage.site.as_str()),
+            ("anthropic_api", "local")
+        );
+        assert!(usage.tiers.is_empty() && usage.quota_buckets.is_empty());
+        assert!(usage.balances.is_empty() && usage.spends.is_empty());
+        assert_eq!(usage.scheduling, ProviderScheduling::default());
+        assert!(usage.upstream.is_none() && usage.is_available.is_none());
+        let price = usage.api_price.unwrap();
+        assert_eq!(price.period_tier.as_deref(), Some("calendar_month"));
+        assert_eq!(price.period_start, Some(month_start));
+        assert!(price.used_percent.is_none() && price.estimated_capacity.is_none());
+        if provider.id == official.id {
+            assert_eq!(price.all_time.request_count, 2);
+            assert_eq!(price.all_time.total_tokens, 2_200_000);
+            assert_eq!(costs(&price.all_time), [("USD".to_owned(), 9.0, 2)]);
+            let period = price.period.unwrap();
+            assert_eq!((period.request_count, period.total_tokens), (1, 1_100_000));
+            assert_eq!(costs(&period), [("USD".to_owned(), 4.5, 1)]);
+        } else {
+            assert_eq!(price.all_time.request_count, 0);
+            assert_eq!(price.period.unwrap().request_count, 0);
+        }
+    }
+
+    let rows = admin.list_provider_usage().await?;
+    let row = |id: &str| rows.iter().find(|row| row.provider_id == id).unwrap();
+    for provider in [official, legacy] {
+        let row = row(&provider.id);
+        assert_eq!(row.status, ProviderUsageQueryStatus::Ok);
+        assert_eq!(row.usage.as_ref().unwrap().kind, "anthropic_api");
+    }
+    // Still the GLM quota backend: the empty key fails instead of going local.
+    assert_eq!(row(&glm.id).status, ProviderUsageQueryStatus::Error);
+    assert_eq!(row(&claude_code.id).status, ProviderUsageQueryStatus::Error);
+    assert_eq!(
+        row(&custom.id).status,
+        ProviderUsageQueryStatus::Unsupported
+    );
+
+    for access in [RouteAccess::default(), RouteAccess::privileged()] {
+        let report = admin.forwarded_provider_usage(&access).await?;
+        let row = report
+            .providers
+            .iter()
+            .find(|row| row.id == official.id)
+            .unwrap();
+        assert_eq!(row.status, ProviderUsageQueryStatus::Unsupported);
+        assert!(row.usage.is_none() && row.usage_entry.is_none());
+    }
+    assert_eq!(gw.quota_registry.snapshot(&official.id), old_scheduling);
+    assert!(
+        gw.usage_snapshots
+            .fresh(&official.id, Duration::from_secs(60))
+            .is_none()
+    );
     Ok(())
 }

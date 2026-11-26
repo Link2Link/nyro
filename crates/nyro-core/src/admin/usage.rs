@@ -198,7 +198,8 @@ pub struct ProviderUsageSpend {
 pub struct ProviderUsage {
     pub provider_id: String,
     /// Query backend kind: `glm_coding_plan` | `minimax_coding_plan` |
-    /// `kimi_coding_plan` | `deepseek_balance`.
+    /// `kimi_coding_plan` | `deepseek_balance` | …; `sub2api` and
+    /// `anthropic_api` are retained-log accounting without an upstream query.
     pub kind: String,
     /// Site the quota was read from: `cn` | `global`.
     pub site: String,
@@ -355,14 +356,63 @@ pub(crate) fn is_codex_usage_provider(provider: &Provider) -> bool {
     UsageBackend::detect(provider) == Some(UsageBackend::OpenAiCodex)
 }
 
-fn is_sub2api_accounting_provider(provider: &Provider) -> bool {
-    // An explicit Nyro relay keeps its existing usage path. Otherwise the
-    // admin accounting view follows the channel, never the URL or name.
-    !crate::provider::nyro_gateway::is_nyro_gateway(provider)
-        && provider
+/// Admin usage served only from this gateway's retained logs: no upstream
+/// quota request, usage credential, cached snapshot or scheduling effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalUsageAccounting {
+    /// Sub2API relay channel. Follows the channel, never the URL or name.
+    Sub2Api,
+    /// Anthropic API-key `default` channel (legacy blank channel included).
+    AnthropicApi,
+}
+
+impl LocalUsageAccounting {
+    fn detect(provider: &Provider) -> Option<Self> {
+        // An explicit Nyro relay keeps its existing usage path.
+        if crate::provider::nyro_gateway::is_nyro_gateway(provider) {
+            return None;
+        }
+        if provider
             .channel
             .as_deref()
             .is_some_and(|channel| channel.trim().eq_ignore_ascii_case("sub2api"))
+        {
+            return Some(Self::Sub2Api);
+        }
+        // A vendor quota backend selected by the Base URL (for example an
+        // Anthropic-compatible GLM or Kimi endpoint) keeps its upstream view.
+        if is_anthropic_default_channel(provider) && UsageBackend::detect(provider).is_none() {
+            return Some(Self::AnthropicApi);
+        }
+        None
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Sub2Api => "sub2api",
+            Self::AnthropicApi => "anthropic_api",
+        }
+    }
+}
+
+/// Identity only: every recorded vendor/preset is `anthropic` and the channel
+/// is `default` or blank. The Claude Code OAuth channel never matches.
+fn is_anthropic_default_channel(provider: &Provider) -> bool {
+    let identities = [provider.vendor.as_deref(), provider.preset_key.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    !identities.is_empty()
+        && identities
+            .iter()
+            .all(|value| value.eq_ignore_ascii_case("anthropic"))
+        && provider
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|channel| channel.is_empty() || channel.eq_ignore_ascii_case("default"))
 }
 
 impl UsageBackend {
@@ -2757,8 +2807,8 @@ enum UsageQueryMode {
 }
 
 impl AdminService {
-    /// Query a configured provider's usage. Sub2API uses retained local logs
-    /// instead of querying upstream quota.
+    /// Query a configured provider's usage. Sub2API and the Anthropic API-key
+    /// default channel use retained local logs instead of upstream quota.
     ///
     /// Supported backends:
     /// - GLM Coding Plan (Zhipu / Z.ai personal plan):
@@ -2771,15 +2821,15 @@ impl AdminService {
     ///   Bearer key.
     pub async fn get_provider_usage(&self, id: &str) -> anyhow::Result<ProviderUsage> {
         let provider = self.get_provider(id).await?;
-        if is_sub2api_accounting_provider(&provider) {
+        if let Some(local) = LocalUsageAccounting::detect(&provider) {
             // Do not refresh quotas or publish this local report to the
             // snapshot cache used by forwarding.
             let now = Utc::now();
             let provider_id = provider.id.clone();
-            let api_price = self.sub2api_api_price_stats(provider, now).await?;
+            let api_price = self.local_api_price_stats(provider, now).await?;
             return Ok(ProviderUsage {
                 provider_id,
-                kind: "sub2api".into(),
+                kind: local.kind().into(),
                 site: "local".into(),
                 level: None,
                 tiers: Vec::new(),
@@ -2835,7 +2885,7 @@ impl AdminService {
         let mut items: Vec<Option<ProviderUsageListItem>> = vec![None; providers.len()];
         let mut jobs = Vec::new();
         for (index, provider) in providers.into_iter().enumerate() {
-            if !is_sub2api_accounting_provider(&provider)
+            if LocalUsageAccounting::detect(&provider).is_none()
                 && UsageBackend::detect(&provider).is_none()
             {
                 items[index] = Some(ProviderUsageListItem::unsupported(&provider));

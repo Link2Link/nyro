@@ -3,7 +3,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import { isKiroOverage, isSub2ApiUsageProvider, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
+import { isKiroOverage, isLocalUsageKind, localUsageKind, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { isClaudeCodeOAuthProvider } from "@/lib/claude-account-pool";
 import { claudeAccountWindowViews, claudeMainObservedAt, claudeMainStale, claudeWindowView, newerClaudeAccount, validObservedAt } from "@/lib/claude-usage-windows";
@@ -16,7 +16,7 @@ import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
-import { Sub2ApiUsageSummary } from "@/components/sub2api-usage-summary";
+import { LocalUsageSummary } from "@/components/local-usage-summary";
 import { hasStructuredQuotaBuckets, isForwardedRouteBucket, isGoogleFamilyDisplayBucket } from "@/lib/quota-bucket-display";
 import { ProviderQuotaBuckets, QuotaBucketAvailability } from "@/components/provider-quota-buckets";
 import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
@@ -414,7 +414,8 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
 
   // Ark usage needs Volcengine IAM AK/SK (distinct from the inference key).
   // Until they are configured the footer stays hidden — no error banner.
-  const localUsage = isSub2ApiUsageProvider(provider);
+  const localKind = localUsageKind(provider);
+  const localUsage = localKind !== null;
   const isArk = !localUsage && isArkProvider(provider);
   const { data: arkCredentials } = useQuery<ProviderUsageCredentials | null>({
     ...arkCredentialsQuery(provider),
@@ -438,7 +439,8 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
     return null;
   }
 
-  const shown = localUsage === (usage?.kind === "sub2api") ? usage : undefined;
+  // Never render a cached report from the other accounting mode.
+  const shown = (localUsage ? usage?.kind === localKind : !isLocalUsageKind(usage?.kind)) ? usage : undefined;
   const balances = shown?.balances ?? [];
   const hasBuckets = !localUsage && hasStructuredQuotaBuckets(shown);
   const pause = localUsage || hasBuckets ? null : providerUsagePause(shown, isZh);
@@ -457,7 +459,7 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
     !pause &&
     (shown?.tiers ?? []).some((tier) => tier.used_percent >= 100) &&
     balances.some((balance) => balance.total > 0);
-  const title = providerUsageTitle(localUsage ? "sub2api" : shown?.kind, isZh);
+  const title = providerUsageTitle(localKind ?? shown?.kind, isZh);
   const errorMessage = error ? localizeBackendErrorMessage(error, isZh) : "";
 
   const claudeSingleton = (shown?.kind === "claude_code_plan" || Boolean(currentClaudeAccount)) && !shown?.account_pool?.config;
@@ -566,8 +568,8 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
         <AlertCircle className="h-3.5 w-3.5 shrink-0" />
         <span className="break-words">{isZh ? "用量查询失败" : "Usage query failed"}: {errorMessage}</span>
       </div>}
-      {localUsage ? (
-        <Sub2ApiUsageSummary stats={shown?.api_price} now={now} loading={isFetching} locale={locale} />
+      {localKind ? (
+        <LocalUsageSummary kind={localKind} stats={shown?.api_price} now={now} loading={isFetching} locale={locale} />
       ) : hasBuckets && shown ? (
         <ProviderQuotaBuckets usage={shown} now={now} stale={Boolean(error)} loading={isFetching} locale={locale} onDetails={setDetailFilter} />
       ) : shown?.upstream ? (

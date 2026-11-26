@@ -8,7 +8,7 @@ import { KiroCredentialImport } from "@/components/kiro-credential-import";
 import { KiroLoginOptionsForm } from "@/components/kiro-login-options";
 import { kiroLoginConfigured, kiroLoginOptions } from "@/lib/kiro-login";
 import { copyToClipboard } from "@/lib/utils";
-import { isSub2ApiUsageProvider, providerUsageSupported } from "@/lib/provider-usage";
+import { localUsageKind, providerUsageSupported } from "@/lib/provider-usage";
 import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, DevinLoginNotice, KiroLoginNotice } from "@/components/oauth-session-status";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { formatAccountTestLogs, formatProviderModelListLog, formatProviderTestSkip, isProviderTestSkipped, mergeProviderTestVerdict, normalizeCachedProviderTestResult, providerTestError, providerTestStatus } from "@/lib/provider-test";
@@ -4199,7 +4199,7 @@ export default function ProvidersPage() {
                     </ProviderMoreActions>
                   </div>
                 </div>
-                {isSub2ApiUsageProvider(p) ? <ProviderUsageFooter provider={p} />
+                {localUsageKind(p) ? <ProviderUsageFooter provider={p} />
                   : isDevinProvider(p) ? <DevinAccountPoolCard provider={p} />
                   : isKiroProvider(p) ? <KiroAccountPoolCard provider={p} />
                   : isClaudeCodeOAuthProvider(p) ? <ClaudeAccountPoolCard provider={p} />

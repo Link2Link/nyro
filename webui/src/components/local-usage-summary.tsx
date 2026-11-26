@@ -1,9 +1,18 @@
 import { formatTokenCount } from "@/lib/format";
 import type { Locale } from "@/lib/i18n";
 import { retainedUsagePriceDisplay } from "@/lib/token-usage";
+import type { LocalUsageKind } from "@/lib/provider-usage";
 import type { ProviderApiPriceStats } from "@/lib/types";
 
-export function Sub2ApiUsageSummary({ stats, now, loading, locale = "en-US" }: {
+const BILLING: Record<LocalUsageKind, { en: string; zh: string }> = {
+  sub2api: { en: "Sub2API billing", zh: "Sub2API 实际账单" },
+  // The default channel may point at a relay, so name neither vendor nor relay.
+  anthropic_api: { en: "upstream billing", zh: "上游实际账单" },
+};
+
+/** Retained-log totals for providers without an upstream quota observation. */
+export function LocalUsageSummary({ kind, stats, now, loading, locale = "en-US" }: {
+  kind: LocalUsageKind;
   stats?: ProviderApiPriceStats | null;
   now: number;
   loading: boolean;
@@ -11,8 +20,8 @@ export function Sub2ApiUsageSummary({ stats, now, loading, locale = "en-US" }: {
 }) {
   const zh = locale === "zh-CN";
   const scope = zh
-    ? "仅统计本供应商在 Nyro 保留的上游尝试（含失败和重试）。Token 为日志已记录用量，API 价格按当前参考价估算，非 Sub2API 实际账单。"
-    : "Retained Nyro logs for this provider, including failed and retried upstream attempts. Tokens are recorded usage; API prices use current reference rates, not Sub2API billing.";
+    ? `仅统计本供应商在 Nyro 保留的上游尝试（含失败和重试）。Token 为日志已记录用量，API 价格按当前参考价估算，非${BILLING[kind].zh}。`
+    : `Retained Nyro logs for this provider, including failed and retried upstream attempts. Tokens are recorded usage; API prices use current reference rates, not ${BILLING[kind].en}.`;
   const start = stats?.period_start;
   const end = stats?.period_end;
   const month = stats?.period_tier === "calendar_month" && start != null && end != null
@@ -23,7 +32,7 @@ export function Sub2ApiUsageSummary({ stats, now, loading, locale = "en-US" }: {
       hint: zh ? "按 UTC 自然月统计，不是上游额度重置周期。" : "UTC calendar month, not an upstream quota reset cycle." },
   ];
 
-  return <div data-sub2api-usage aria-busy={loading && !stats} className="border-t border-slate-200/70 pt-2" title={scope}>
+  return <div data-local-usage={kind} aria-busy={loading && !stats} className="border-t border-slate-200/70 pt-2" title={scope}>
     <div className="grid grid-cols-2 gap-x-4 sm:gap-x-6">
       {scopes.map(({ key, label, hint, totals }) => {
         const price = totals ? retainedUsagePriceDisplay(totals, zh, locale) : null;
@@ -34,7 +43,7 @@ export function Sub2ApiUsageSummary({ stats, now, loading, locale = "en-US" }: {
           { key: "price", label: zh ? "等价 API 价格" : "Equivalent API price", text: price?.text, title: price?.title,
             partial: Boolean(totals?.unpriced_request_count) },
         ];
-        return <div key={key} data-sub2api-scope={key} className="min-w-0">
+        return <div key={key} data-local-usage-scope={key} className="min-w-0">
           <p className="mb-1 text-xs font-medium text-slate-700" title={hint}>{label}</p>
           <dl className="space-y-1">
             {fields.map((field) => <div key={field.key} className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-2">

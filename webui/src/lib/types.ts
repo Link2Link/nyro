@@ -1208,7 +1208,7 @@ export interface ProviderUsage {
   scheduling?: ProviderScheduling;
   /** Native Devin/Kiro account readiness, including legacy single-account providers. */
   account_pool?: AccountPoolView | null;
-  /** Retained-log prices for supported plans and Sub2API; not upstream billing or routing quota. */
+  /** Retained-log prices for supported plans, Sub2API and the Anthropic API default channel; not upstream billing or routing quota. */
   api_price?: ProviderApiPriceStats | null;
   /** Anonymous, display-only upstream account-pool totals; never routing input or account identities. */
   pool_quota?: NyroUpstreamPoolQuota | null;

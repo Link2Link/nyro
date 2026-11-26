@@ -1,6 +1,6 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { isKiroOverage, isSub2ApiUsageProvider, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
+import { isKiroOverage, isLocalUsageKind, localUsageKind, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
 import type { PoolQuotaWindow } from "./devin-account-pool";
 import type { NyroUpstreamProvider, ProviderUsage } from "./types";
 
@@ -9,15 +9,42 @@ const kiro = { vendor: "kiro", preset_key: "kiro", channel: "ide", auth_mode: "o
 test("Sub2API local accounting requires the channel and never replaces a Nyro relay", () => {
   const sub2api = { vendor: "openai", preset_key: "openai", channel: " Sub2API ",
     auth_mode: "apikey" as const, base_url: "https://relay.example.test" };
-  equal(isSub2ApiUsageProvider(sub2api), true);
-  equal(isSub2ApiUsageProvider({ ...sub2api, channel: "default" }), false);
+  equal(localUsageKind(sub2api), "sub2api");
+  equal(localUsageKind({ ...sub2api, channel: "default" }), null);
   equal(providerUsageSupported(sub2api), false);
   equal(providerUsageSupported({ ...sub2api, base_url: "https://chatgpt.com/backend-api/codex", auth_mode: "oauth" }), false);
   const relay = { ...sub2api, preset_key: " Nyro-Gateway " };
-  equal(isSub2ApiUsageProvider(relay), false);
+  equal(localUsageKind(relay), null);
   equal(providerUsageSupported(relay), true);
   equal(providerUsageTitle("sub2api", false), "Sub2API Usage");
   equal(providerUsageTitle("sub2api", true), "Sub2API 用量");
+});
+
+test("Anthropic default channel uses local accounting unless a vendor quota URL applies", () => {
+  const anthropic = { vendor: "anthropic", preset_key: "anthropic", channel: "default",
+    auth_mode: "apikey" as const, base_url: "https://api.anthropic.com" };
+  equal(localUsageKind(anthropic), "anthropic_api");
+  equal(localUsageKind({ ...anthropic, base_url: "https://relay.example.test" }), "anthropic_api");
+  // Legacy rows predate the channel field and mean the default channel.
+  equal(localUsageKind({ ...anthropic, vendor: " Anthropic ", preset_key: null, channel: null }), "anthropic_api");
+  equal(localUsageKind({ ...anthropic, channel: " " }), "anthropic_api");
+  equal(providerUsageSupported(anthropic), false);
+  // Vendor quota hosts keep their upstream usage backend.
+  for (const base_url of ["https://open.bigmodel.cn/api/anthropic", "https://api.kimi.com/coding", "https://api.deepseek.com/anthropic"]) {
+    equal(localUsageKind({ ...anthropic, base_url }), null);
+    equal(providerUsageSupported({ ...anthropic, base_url }), true);
+  }
+  // The Claude Code subscription channel and mixed or blank identities never match.
+  equal(localUsageKind({ ...anthropic, channel: "claude-code", auth_mode: "oauth" }), null);
+  equal(providerUsageSupported({ ...anthropic, channel: "claude-code", auth_mode: "oauth" }), true);
+  equal(localUsageKind({ ...anthropic, preset_key: "custom" }), null);
+  equal(localUsageKind({ ...anthropic, vendor: null, preset_key: null }), null);
+  equal(localUsageKind({ ...anthropic, preset_key: "nyro-gateway" }), null);
+  equal(isLocalUsageKind("anthropic_api"), true);
+  equal(isLocalUsageKind("sub2api"), true);
+  equal(isLocalUsageKind("claude_code_plan"), false);
+  equal(providerUsageTitle("anthropic_api", false), "Anthropic API Usage");
+  equal(providerUsageTitle("anthropic_api", true), "Anthropic API 用量");
 });
 
 test("Kiro usage requires OAuth identity, not an Amazon Q URL alone", () => {
