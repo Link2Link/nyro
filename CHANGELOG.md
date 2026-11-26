@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.57
+
+> Released on 2026-11-27
+
+#### Features
+
+- **Anthropic API usage**: Anthropic providers on the Default (API key) channel now show the same usage card as Sub2API: upstream attempts, recorded tokens and API-equivalent prices for all retained history and the current UTC calendar month. Relay Base URLs are included, and legacy rows without a channel count as Default. The figures come from this gateway's logs, not the upstream bill; no upstream request or usage credential is needed and routing is unchanged. Claude Code subscriptions keep their subscription usage, and a Base URL served by a vendor quota backend (such as GLM, Kimi or DeepSeek) keeps that upstream view.
+
+---
+
 ## v2.1.56
 
 > Released on 2026-11-26
