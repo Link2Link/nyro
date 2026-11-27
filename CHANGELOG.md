@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.59
+
+> Released on 2026-11-27
+
+#### Fixes
+
+- **Sub2API local-only usage accounting**: Sub2API providers (both the new preset and the legacy OpenAI channel) now stay on local retained-log usage accounting only and no longer poll upstream `/v1/usage` balances or pause routing based on upstream balance/quota. Private or zero-balance SimpleMode Sub2API deployments remain schedulable while keeping pre-execution billing/configuration rejection failover and diagnostic hints.
+
+---
+
 ## v2.1.58
 
 > Released on 2026-11-27
