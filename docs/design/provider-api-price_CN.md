@@ -10,7 +10,7 @@ MiniMax、GLM、xAI/Grok、OpenAI Codex OAuth 和 Google Gemini 订阅供应商�
 
 ## 日志保留与计价
 
-**Sub2API** 和 **Anthropic 默认渠道**（API Key，`anthropic_api`）没有上游额度窗口。供应商卡片只显示**累计**和**本月**两栏，各列出保留的上游请求数、已记录 Token 和等价 API 价格。本月从 UTC 月初第一天 00:00 起统计到查询时刻。管理界面直接读取本地日志，不需要请求上游或配置用量凭据，不预估容量，也不改变路由资格。
+**Anthropic 默认渠道**（API Key，`anthropic_api`）没有上游额度窗口；**Sub2API** 只有一个 Key 时（`sub2api_key`）显示 Sub2API 自身报告的额度与消费，启用 Key 池、没有 Key 或地址不提供 `/v1/usage` 时（`sub2api`）同样没有上游额度窗口。供应商卡片均显示**累计**和**本月**两栏（`sub2api_key` 位于额度窗口下方），各列出保留的上游请求数、已记录 Token 和等价 API 价格。本月从 UTC 月初第一天 00:00 起统计到查询时刻。管理界面直接读取本地日志，不需要请求上游或配置用量凭据，不预估容量，也不改变路由资格。
 
 Anthropic 仅按身份识别：记录的 vendor / preset 必须全部为 `anthropic`，渠道为 `default`（旧记录渠道为空时视为 `default`）；Base URL 指向中转站同样适用。Claude Code OAuth 渠道仍显示订阅用量。若 Base URL 命中厂商额度后端（例如经 Anthropic 兼容端点接入的 GLM、Kimi、DeepSeek），则保留该上游额度视图。
 
@@ -40,12 +40,12 @@ Google 目录观察成功不等于计价失败：即使配额绑定/周期待确
 
 ## 管理接口
 
-`GET /api/v1/providers/:id/usage`、批量管理用量列表和已有桌面命令 `get_provider_usage` 共用可选字段 `api_price`，仅对 `glm_coding_plan`、`minimax_coding_plan`、`grok_plan`、`openai_codex`、`google_subscription`、`sub2api` 和 `anthropic_api` 返回：
+`GET /api/v1/providers/:id/usage`、批量管理用量列表和已有桌面命令 `get_provider_usage` 共用可选字段 `api_price`，仅对 `glm_coding_plan`、`minimax_coding_plan`、`grok_plan`、`openai_codex`、`google_subscription`、`sub2api`、`sub2api_key` 和 `anthropic_api` 返回：
 
 | 字段 | 含义 |
 | --- | --- |
 | `all_time` | 保留日志统计：`total_tokens`、`request_count`、`equivalent_costs`、`unpriced_request_count`。 |
-| `period` | 已知且有效的当前周期统计，或 Sub2API / Anthropic API 的本自然月统计；否则为 `null`。 |
+| `period` | 已知且有效的当前周期统计，或 Sub2API（`sub2api` / `sub2api_key`）/ Anthropic API 的本自然月统计；否则为 `null`。 |
 | `period_start`、`period_end` | 毫秒时间戳，左闭右开；否则为 `null`。 |
 | `period_tier` | 选定的标准额度窗口；Sub2API / Anthropic API 为 `calendar_month`；没有周期时为 `null`。 |
 | `used_percent` | 该窗口在 `[0, 100]` 内的有限已用百分比；否则为 `null`。 |

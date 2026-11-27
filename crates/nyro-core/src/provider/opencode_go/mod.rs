@@ -84,6 +84,7 @@ const METADATA: VendorMetadata = VendorMetadata {
         // them from a single key field (and keeps the channel adaptive).
         shared_key_protocols: true,
         auth_schemes: Some(AUTH_SCHEMES),
+        ..ChannelDef::DEFAULT
     }],
 };
 

@@ -2,6 +2,7 @@ import type { NyroUpstreamProvider, NyroUpstreamUsage, Provider, ProviderUsage }
 import { nativeProviderProtocol } from "./native-provider";
 import { accountStateLabel, type PoolQuotaWindow } from "./devin-account-pool";
 import { isNyroGatewayPreset } from "./nyro-gateway";
+import { relaysSub2Api, sub2apiUpstreamUsage } from "./sub2api";
 
 export interface ProviderUsagePause {
   message: string;
@@ -46,7 +47,8 @@ export function providerUsagePause(
   };
 }
 
-type UsageIdentity = Pick<Provider, "base_url" | "vendor" | "preset_key" | "channel" | "auth_mode">;
+type UsageIdentity = Pick<Provider, "base_url" | "vendor" | "preset_key" | "channel" | "auth_mode">
+  & Partial<Pick<Provider, "api_key" | "keys" | "protocol_endpoints">>;
 
 /** Usage computed from this gateway's retained logs, not an upstream quota observation. */
 export type LocalUsageKind = "sub2api" | "anthropic_api";
@@ -68,7 +70,10 @@ function isAnthropicDefaultChannel(provider: Pick<Provider, "vendor" | "preset_k
 /** Local accounting kind. Mirrors nyro-core `admin::usage::LocalUsageAccounting::detect`. */
 export function localUsageKind(provider: UsageIdentity): LocalUsageKind | null {
   if ([provider.vendor, provider.preset_key].some(isNyroGatewayPreset)) return null;
-  if (provider.channel?.trim().toLowerCase() === "sub2api") return "sub2api";
+  // The Sub2API preset (any platform) and the legacy channel follow identity: the
+  // relay is any host, so vendor quota URLs below must never match it. One key
+  // reads its quota upstream; key pools and keyless rows stay local.
+  if (relaysSub2Api(provider)) return sub2apiUpstreamUsage(provider) ? null : "sub2api";
   // A vendor quota backend selected by Base URL keeps its upstream view.
   if (isAnthropicDefaultChannel(provider) && !upstreamUsageSupported(provider)) return "anthropic_api";
   return null;
@@ -81,6 +86,8 @@ export function providerUsageSupported(provider: UsageIdentity): boolean {
 }
 
 function upstreamUsageSupported(provider: UsageIdentity): boolean {
+  // A Sub2API relay never matches the vendor URL rules below.
+  if (relaysSub2Api(provider)) return sub2apiUpstreamUsage(provider);
   const url = provider.base_url.toLowerCase();
   const vendor = (provider.vendor ?? provider.preset_key ?? "").toLowerCase();
   const isCodexOAuth =
@@ -158,6 +165,7 @@ export function providerApiPriceSupported(kind: string | undefined): boolean {
 
 export function providerUsageTitle(kind: string | undefined, isZh: boolean): string {
   if (kind === "sub2api") return isZh ? "Sub2API 用量" : "Sub2API Usage";
+  if (kind === "sub2api_key") return isZh ? "Sub2API 额度" : "Sub2API Quota";
   if (kind === "anthropic_api") return isZh ? "Anthropic API 用量" : "Anthropic API Usage";
   if (kind?.endsWith("_balance")) return isZh ? "账户余额" : "Balance";
   if (kind === "openai_codex") return isZh ? "ChatGPT Codex 用量" : "ChatGPT Codex Usage";
@@ -178,6 +186,7 @@ const TIER_LABELS_ZH: Record<string, string> = {
   secondary_window: "次要窗口",
   gemini: "Gemini 共享池",
   nyro_upstream: "上游供应商全部暂停",
+  key_quota: "Key 总额度",
 };
 const TIER_LABELS_EN: Record<string, string> = {
   five_hour: "5h",
@@ -188,6 +197,7 @@ const TIER_LABELS_EN: Record<string, string> = {
   secondary_window: "Secondary Window",
   gemini: "Gemini Shared Pool",
   nyro_upstream: "All upstream providers paused",
+  key_quota: "Key quota",
 };
 
 function readableFeatureName(value: string): string {

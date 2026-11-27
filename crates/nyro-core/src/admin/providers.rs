@@ -101,6 +101,98 @@ struct ClaudeCodeProbe {
     credential: Option<crate::auth::types::StoredCredential>,
 }
 
+/// Sub2API connectivity check for one protocol endpoint, spending no
+/// tokens: the platform's model listing on the same route family the
+/// endpoint dispatches to (`/v1beta/models` for Gemini, `/v1/models`
+/// otherwise, both behind the platform prefix). A JSON answer proves the
+/// address is a Sub2API API root, the key is valid and the group serves the
+/// route; `400` / `404` here mean the platform does not match the group.
+async fn sub2api_endpoint_check(
+    client: &reqwest::Client,
+    platform: crate::provider::sub2api::Sub2ApiPlatform,
+    protocol: crate::protocol::ids::Protocol,
+    endpoint: &ProviderProtocolEndpoint,
+) -> anyhow::Result<()> {
+    let path = if protocol == crate::protocol::ids::Protocol::GoogleGemini {
+        "/v1beta/models"
+    } else {
+        "/v1/models"
+    };
+    let base =
+        crate::provider::sub2api::url::route_base(Some(platform), protocol, &endpoint.base_url);
+    let url = reqwest::Url::parse(&format!("{base}{path}"))?;
+    let response = client
+        .get(url)
+        .header(AUTHORIZATION, format!("Bearer {}", endpoint.api_key.trim()))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!(format_connectivity_error(&error)))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let preview: String = body.chars().take(200).collect();
+        let hint = match crate::provider::sub2api::errors::classify_bytes(
+            status.as_u16(),
+            body.as_bytes(),
+        ) {
+            Some(rejection) => format!(" — {}", rejection.hint()),
+            None => match status.as_u16() {
+                401 => " — the Sub2API API key is invalid or disabled".to_string(),
+                400 | 404 => {
+                    " — the Sub2API group platform does not serve this route; check the selected platform"
+                        .to_string()
+                }
+                _ => String::new(),
+            },
+        };
+        anyhow::bail!("HTTP {status}: {preview}{hint}");
+    }
+    if serde_json::from_str::<Value>(&body).is_err() {
+        anyhow::bail!(
+            "the address did not answer like a Sub2API API (non-JSON response); use the Sub2API site root"
+        );
+    }
+    Ok(())
+}
+
+/// Canonical channel for probe request shaping, derived from vendor +
+/// channel identity. Channel ids alone collide across vendors (`antigravity`
+/// is both the Google OAuth channel and a Sub2API platform), so the probe
+/// builders only ever see `antigravity` / `gemini-cli` for the Google
+/// subscription surface and `codex` for a Codex consumer upstream (codex
+/// OAuth, the legacy `sub2api` channel, Sub2API's OpenAI platform).
+fn probe_channel(provider: &Provider) -> Option<&'static str> {
+    if crate::provider::google::antigravity::is_google_antigravity(provider) {
+        Some("antigravity")
+    } else if crate::provider::google::gemini_cli::is_google_gemini_cli(provider) {
+        Some("gemini-cli")
+    } else if crate::provider::dialect::is_codex_consumer(provider) {
+        Some("codex")
+    } else {
+        None
+    }
+}
+
+/// Probe channels that carry the Codex consumer Fast-tier policy.
+fn is_codex_probe_channel(channel: &str) -> bool {
+    let channel = channel.trim();
+    channel.eq_ignore_ascii_case("codex") || channel.eq_ignore_ascii_case("sub2api")
+}
+
+/// Endpoint auth scheme for admin probes: `auto` follows each protocol's
+/// default (Anthropic `x-api-key`, Gemini `?key=`, otherwise Bearer).
+fn probe_auth_scheme(raw: &str, suite: crate::protocol::ids::Protocol) -> &str {
+    match raw.trim() {
+        "" | "auto" => match suite {
+            crate::protocol::ids::Protocol::AnthropicMessages => "x-api-key",
+            crate::protocol::ids::Protocol::GoogleGemini => "query",
+            _ => "bearer",
+        },
+        explicit => explicit,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_model_probe_request(
     suite: crate::protocol::ids::Protocol,
@@ -172,6 +264,7 @@ fn build_model_probe_request(
             return build_gemini_model_probe_request(
                 base_url,
                 api_key,
+                auth_scheme,
                 runtime_headers,
                 model,
                 prompt,
@@ -182,7 +275,10 @@ fn build_model_probe_request(
     };
 
     crate::provider::common::pipeline::apply_openai_speed_mode_for_protocol(
-        &mut body, fast_mode, channel, suite,
+        &mut body,
+        fast_mode,
+        channel.is_some_and(is_codex_probe_channel),
+        suite,
     );
 
     let path = if is_codex_oauth && path == "/v1/responses" {
@@ -238,11 +334,18 @@ fn build_model_probe_request(
 ///   on `runtime_headers`; the body wraps into the v1internal envelope and
 ///   the URL becomes `/v1internal:streamGenerateContent?alt=sse`.
 /// * default API-key channel (or AI-Studio-style OAuth Bearer): plain Gemini
-///   body on `/v1beta/models/{model}:streamGenerateContent?alt=sse` with
-///   `?key=` (or bare Bearer headers) auth.
+///   body on `/v1beta/models/{model}:streamGenerateContent?alt=sse`, authed
+///   by runtime Bearer headers when present, else by the endpoint scheme
+///   (`query` appends `&key=`; relays such as Sub2API declare `bearer`).
+///
+/// `channel` must come from [`probe_channel`]: a bare channel id would
+/// collide across vendors (a Sub2API `antigravity` platform is not the
+/// Google subscription surface).
+#[allow(clippy::too_many_arguments)]
 fn build_gemini_model_probe_request(
     base_url: &str,
     api_key: &str,
+    auth_scheme: &str,
     runtime_headers: &HeaderMap,
     model: &str,
     prompt: &str,
@@ -281,12 +384,27 @@ re-login the provider to re-run onboarding"
         ));
     }
 
-    if api_key.trim().is_empty() && !headers.contains_key(AUTHORIZATION) {
+    let mut url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse");
+    if headers.contains_key(AUTHORIZATION) {
+        return Ok((url, headers, inner_body));
+    }
+    let scheme = auth_scheme.trim();
+    if api_key.trim().is_empty() && scheme != "none" {
         anyhow::bail!("provider api key is empty");
     }
-    let mut url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse");
-    if !headers.contains_key(AUTHORIZATION) {
-        url.push_str(&format!("?key={api_key}"));
+    match scheme {
+        "bearer" => {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+            );
+        }
+        "x-api-key" => {
+            headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
+        }
+        "none" => {}
+        "" | "auto" | "query" => url.push_str(&format!("&key={api_key}")),
+        other => anyhow::bail!("unsupported auth scheme: {other}"),
     }
     Ok((url, headers, inner_body))
 }
@@ -368,6 +486,7 @@ async fn probe_single_model(
     is_codex_oauth: bool,
     antigravity_project: Option<&str>,
     claude_code: Option<&ClaudeCodeProbe>,
+    sub2api: bool,
 ) -> ProviderModelProbeResult {
     let start = Instant::now();
 
@@ -436,7 +555,17 @@ async fn probe_single_model(
                     status.as_u16(),
                     body_text.as_bytes(),
                 );
-            let hint = if let Some(refusal) = &entitlement {
+            let sub2api_rejection = sub2api
+                .then(|| {
+                    crate::provider::sub2api::errors::classify_bytes(
+                        status.as_u16(),
+                        body_text.as_bytes(),
+                    )
+                })
+                .flatten();
+            let hint = if let Some(rejection) = sub2api_rejection {
+                format!(" — {}", rejection.hint())
+            } else if let Some(refusal) = &entitlement {
                 refusal.hint()
             } else if body_text.contains("Verify your account") {
                 " — Google is gating this account: open https://antigravity.google \
@@ -1280,8 +1409,6 @@ fn resolve_probe_target(
     default: &ProbeTarget,
     pool_key: Option<&crate::db::models::ProviderKey>,
 ) -> Result<ProbeTarget, crate::error::GatewayError> {
-    use crate::protocol::ids::Protocol;
-
     let Some(endpoint) = crate::provider::key_pool::resolve_endpoint(provider, pool_key, model)?
     else {
         return Ok(default.clone());
@@ -1322,13 +1449,7 @@ fn resolve_probe_target(
         ));
     }
     let suite = endpoint.protocol.protocol;
-    let auth_scheme = match endpoint.auth_scheme.trim() {
-        "" | "auto" => match suite {
-            Protocol::AnthropicMessages => "x-api-key",
-            _ => "bearer",
-        },
-        explicit => explicit,
-    };
+    let auth_scheme = probe_auth_scheme(&endpoint.auth_scheme, suite);
     Ok(ProbeTarget {
         suite,
         protocol_id: endpoint.protocol.to_string(),
@@ -1455,10 +1576,11 @@ mod probe_routing_tests {
             let (_, _, body) = build_gemini_model_probe_request(
                 "https://cloudcode-pa.googleapis.com",
                 "probe-token",
+                "none",
                 &HeaderMap::new(),
                 &resolved[model],
                 DEFAULT_MODEL_PROBE_PROMPT,
-                provider.channel.as_deref(),
+                probe_channel(&provider),
                 Some("probe-project"),
             )
             .unwrap();
@@ -1951,7 +2073,20 @@ impl AdminService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("provider not found: {id}"))
     }
-    pub async fn create_provider(&self, input: CreateProvider) -> anyhow::Result<Provider> {
+    pub async fn create_provider(&self, mut input: CreateProvider) -> anyhow::Result<Provider> {
+        if crate::provider::sub2api::is_sub2api_identity(
+            input.vendor.as_deref(),
+            input.preset_key.as_deref(),
+        ) {
+            crate::provider::sub2api::normalize_admin_fields(
+                input.channel.as_deref(),
+                &input.auth_mode,
+                &mut input.base_url,
+                &mut input.protocol_endpoints,
+                Some(&mut input.keys),
+                &mut input.models_source,
+            )?;
+        }
         validate_provider_input(&input)?;
         let name = normalize_name(&input.name, "provider name")?;
         self.ensure_provider_name_unique(None, &name).await?;
@@ -2195,13 +2330,13 @@ impl AdminService {
         } else {
             normalize_vendor(current.vendor.as_deref())
         };
-        let models_source = models_source_input
+        let mut models_source = models_source_input
             .or_else(|| current.models_source.as_deref().map(ToString::to_string));
         let raw_protocol = input
             .protocol
             .clone()
             .unwrap_or_else(|| current.protocol.clone());
-        let raw_base_url = input
+        let mut raw_base_url = input
             .base_url
             .clone()
             .unwrap_or_else(|| current.base_url.clone());
@@ -2242,7 +2377,7 @@ impl AdminService {
             vendor.as_deref(),
             preset_key.as_deref(),
         )?;
-        let raw_endpoints = input.protocol_endpoints.clone().unwrap_or_else(|| {
+        let mut raw_endpoints = input.protocol_endpoints.clone().unwrap_or_else(|| {
             current
                 .protocol_endpoints
                 .iter()
@@ -2256,6 +2391,17 @@ impl AdminService {
                 })
                 .collect()
         });
+        let mut input_keys = input.keys.clone();
+        if crate::provider::sub2api::is_sub2api_identity(vendor.as_deref(), preset_key.as_deref()) {
+            crate::provider::sub2api::normalize_admin_fields(
+                channel.as_deref(),
+                &auth_mode,
+                &mut raw_base_url,
+                &mut raw_endpoints,
+                input_keys.as_deref_mut(),
+                &mut models_source,
+            )?;
+        }
         validate_provider_input(&CreateProvider {
             name: name.clone(),
             vendor: vendor.clone(),
@@ -2263,7 +2409,7 @@ impl AdminService {
             base_url: raw_base_url.clone(),
             protocol_mode: protocol_mode.to_string(),
             protocol_endpoints: raw_endpoints.clone(),
-            keys: input.keys.clone().unwrap_or_else(|| {
+            keys: input_keys.clone().unwrap_or_else(|| {
                 current
                     .keys
                     .iter()
@@ -2323,7 +2469,7 @@ impl AdminService {
                     keys: if auth_mode == "oauth" {
                         Some(Vec::new())
                     } else {
-                        input.keys
+                        input_keys
                     },
                     preset_key,
                     channel,
@@ -2612,10 +2758,11 @@ impl AdminService {
         }
 
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+        let sub2api = crate::provider::sub2api::Sub2ApiPlatform::of_preset(provider);
         let results = futures::future::join_all(
             endpoints
                 .into_iter()
-                .map(|endpoint| self.test_adaptive_endpoint(client.clone(), endpoint)),
+                .map(|endpoint| self.test_adaptive_endpoint(client.clone(), endpoint, sub2api)),
         )
         .await;
 
@@ -2667,14 +2814,19 @@ impl AdminService {
         &self,
         client: reqwest::Client,
         endpoint: ProviderProtocolEndpoint,
+        sub2api: Option<crate::provider::sub2api::Sub2ApiPlatform>,
     ) -> EndpointTestResult {
         let start = Instant::now();
         let tested_at = Utc::now().to_rfc3339();
         let outcome = async {
-            let mut url = reqwest::Url::parse(endpoint.base_url.trim())?;
             let protocol = crate::protocol::registry::ProtocolRegistry::global()
                 .resolve_alias(&endpoint.protocol)
                 .ok_or_else(|| anyhow::anyhow!("unsupported protocol endpoint"))?;
+            if let Some(platform) = sub2api {
+                return sub2api_endpoint_check(&client, platform, protocol.protocol, &endpoint)
+                    .await;
+            }
+            let mut url = reqwest::Url::parse(endpoint.base_url.trim())?;
             let auth_scheme = match endpoint.auth_scheme.trim() {
                 "" | "auto" => match protocol.protocol {
                     crate::protocol::ids::Protocol::AnthropicMessages => "x-api-key",
@@ -3070,13 +3222,7 @@ impl AdminService {
             anyhow::bail!("provider api key is empty");
         }
 
-        let effective_scheme = match auth_scheme.trim() {
-            "" | "auto" => match suite {
-                crate::protocol::ids::Protocol::AnthropicMessages => "x-api-key",
-                _ => "bearer",
-            },
-            explicit => explicit,
-        };
+        let effective_scheme = probe_auth_scheme(&auth_scheme, suite);
 
         let is_codex_oauth = provider.effective_auth_mode().trim() == "oauth"
             && provider
@@ -3095,7 +3241,11 @@ impl AdminService {
             .map(|endpoint| endpoint.to_string())
             .unwrap_or_else(|| suite_raw.clone());
         let fast_mode = provider.fast_mode;
-        let channel = provider.channel.clone();
+        let channel = probe_channel(&provider);
+        // Sub2API: probes append the standard paths themselves, so fold the
+        // platform route prefix (Antigravity's `/antigravity`) into the base
+        // and authenticate every protocol with Bearer, like dispatch.
+        let sub2api_platform = crate::provider::sub2api::Sub2ApiPlatform::of_preset(&provider);
 
         let default_target = ProbeTarget {
             suite,
@@ -3131,7 +3281,6 @@ impl AdminService {
                 &provider,
                 &model,
             );
-            let channel = channel.clone();
             let antigravity_project = antigravity_project.clone();
             let claude_code_probe = claude_code_probe.clone();
             let wire_model = subscription_probe_models
@@ -3162,6 +3311,14 @@ impl AdminService {
                         format!("no enabled provider key is eligible for model '{model}'"),
                     ));
                 }
+                if let Some(platform) = sub2api_platform {
+                    target.base_url = crate::provider::sub2api::url::route_base(
+                        Some(platform),
+                        target.suite,
+                        &target.base_url,
+                    );
+                    target.auth_scheme = "bearer".to_string();
+                }
                 Ok(target)
             });
             async move {
@@ -3180,10 +3337,11 @@ impl AdminService {
                     &prompt,
                     &target.protocol_id,
                     fast_mode,
-                    channel.as_deref(),
+                    channel,
                     is_codex_oauth,
                     antigravity_project.as_deref(),
                     claude_code_probe.as_deref(),
+                    sub2api_platform.is_some(),
                 )
                 .await;
                 if let Some(endpoint_source) = google_endpoint_source {
@@ -3695,6 +3853,12 @@ impl AdminService {
             Some((protocol, api_key)) => (protocol, api_key),
             None => (provider.protocol.clone(), credential),
         };
+        // Sub2API: Bearer on every listing route, never a `?key=` query.
+        let auth_protocol = if crate::provider::sub2api::is_sub2api(provider) {
+            "openai-compatible".to_string()
+        } else {
+            auth_protocol
+        };
         // google/antigravity: per-account dynamic catalog first (new models
         // surface here before any static list ships); curated fallback below.
         if let Some(models) = self
@@ -3720,6 +3884,11 @@ impl AdminService {
             .or_else(|| provider.effective_models_source().map(ToString::to_string))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
+            .or_else(|| {
+                crate::provider::sub2api::is_sub2api(provider)
+                    .then(|| resolve_models_endpoint(provider))
+                    .flatten()
+            })
             .ok_or_else(|| anyhow::anyhow!("Model Discovery URL is empty"))?;
 
         if let Some(models) = lookup_models_dev_models(&self.gw.config.data_dir, &endpoint)? {
@@ -3863,6 +4032,12 @@ impl AdminService {
         let (auth_protocol, auth_credential) = match adaptive_model_fetch_auth(provider) {
             Some((protocol, api_key)) => (protocol, api_key),
             None => (provider.protocol.clone(), credential),
+        };
+        // Sub2API: Bearer on every listing route, never a `?key=` query.
+        let auth_protocol = if crate::provider::sub2api::is_sub2api(provider) {
+            "openai-compatible".to_string()
+        } else {
+            auth_protocol
         };
         // Dynamic per-account catalog first; static curated list is fallback.
         if let Some(models) = self
@@ -4145,6 +4320,7 @@ mod probe_reply_tests {
         let (url, headers, body) = build_gemini_model_probe_request(
             "https://cloudcode-pa.googleapis.com",
             "ya29.probe",
+            "none",
             &runtime_headers,
             "gemini-2.5-pro",
             DEFAULT_MODEL_PROBE_PROMPT,
@@ -4247,6 +4423,7 @@ mod probe_reply_tests {
                 false,
                 Some("fixture-project"),
                 None,
+                false,
             )
             .await;
             assert!(result.success, "{}", result.error.unwrap_or_default());
@@ -4259,6 +4436,7 @@ mod probe_reply_tests {
         let error = build_gemini_model_probe_request(
             "https://cloudcode-pa.googleapis.com",
             "ya29.probe",
+            "none",
             &HeaderMap::new(),
             "gemini-2.5-pro",
             DEFAULT_MODEL_PROBE_PROMPT,
@@ -4271,22 +4449,81 @@ mod probe_reply_tests {
 
     #[test]
     fn google_default_probe_request_uses_query_key() {
-        let (url, _headers, body) = build_gemini_model_probe_request(
-            "https://generativelanguage.googleapis.com",
-            "gem-key",
+        for scheme in ["query", "auto", ""] {
+            let (url, headers, body) = build_gemini_model_probe_request(
+                "https://generativelanguage.googleapis.com",
+                "gem-key",
+                scheme,
+                &HeaderMap::new(),
+                "gemini-2.5-flash",
+                DEFAULT_MODEL_PROBE_PROMPT,
+                None,
+                None,
+            )
+            .unwrap();
+            // The key joins the existing `alt=sse` query instead of opening a
+            // second `?` (which would fold it into the `alt` value).
+            assert_eq!(
+                url,
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=gem-key"
+            );
+            assert!(!headers.contains_key(AUTHORIZATION));
+            assert!(body.get("contents").is_some());
+            assert!(body.get("request").is_none());
+        }
+    }
+
+    #[test]
+    fn relay_gemini_probe_honors_explicit_bearer() {
+        // Sub2API rejects `?key=` on /v1 routes and accepts Bearer on every
+        // route; its Antigravity Gemini route carries the platform prefix.
+        let (url, headers, body) = build_gemini_model_probe_request(
+            "https://s.example.com/antigravity",
+            "sk-relay",
+            "bearer",
             &HeaderMap::new(),
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
             DEFAULT_MODEL_PROBE_PROMPT,
-            Some("default"),
+            None,
             None,
         )
         .unwrap();
         assert_eq!(
             url,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse?key=gem-key"
+            "https://s.example.com/antigravity/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
         );
-        assert!(body.get("contents").is_some());
-        assert!(body.get("request").is_none());
+        assert_eq!(headers[AUTHORIZATION], "Bearer sk-relay");
+        assert!(body.get("request").is_none(), "no v1internal envelope");
+    }
+
+    #[test]
+    fn probe_channel_is_vendor_qualified() {
+        let make = |vendor: &str, channel: &str| -> Provider {
+            serde_json::from_value(serde_json::json!({
+                "id":"p", "name":"p", "vendor":vendor, "preset_key":vendor, "channel":channel,
+                "protocol":"google-gemini", "base_url":"https://example.invalid",
+                "api_key":"k", "auth_mode":"apikey",
+                "last_test_success":null,"last_test_at":null,
+                "is_enabled":true,"created_at":"","updated_at":""
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            probe_channel(&make("google", "antigravity")),
+            Some("antigravity")
+        );
+        assert_eq!(
+            probe_channel(&make("google", "gemini-cli")),
+            Some("gemini-cli")
+        );
+        assert_eq!(probe_channel(&make("openai", "codex")), Some("codex"));
+        assert_eq!(probe_channel(&make("openai", "sub2api")), Some("codex"));
+        assert_eq!(probe_channel(&make("sub2api", "openai")), Some("codex"));
+        // Sub2API platforms sharing Google / xAI channel names stay plain.
+        for channel in ["antigravity", "gemini", "grok", "anthropic"] {
+            assert_eq!(probe_channel(&make("sub2api", channel)), None, "{channel}");
+        }
+        assert_eq!(probe_channel(&make("custom", "antigravity")), None);
     }
 
     #[test]

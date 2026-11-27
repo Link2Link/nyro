@@ -158,6 +158,17 @@ pub async fn create_provider(
 }
 
 #[tauri::command]
+pub async fn detect_sub2api_platform(
+    gw: State<'_, Gateway>,
+    input: nyro_core::admin::Sub2ApiDetectInput,
+) -> Result<nyro_core::admin::Sub2ApiPlatformDetection, String> {
+    gw.admin()
+        .detect_sub2api_platform(input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn copy_provider(
     gw: State<'_, Gateway>,
     id: String,

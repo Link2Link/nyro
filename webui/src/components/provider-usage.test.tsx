@@ -307,6 +307,48 @@ test("folded quota summaries do not query Sub2API local accounting", () => {
 
 const anthropicProvider: Provider = { ...provider, id: "anthropic", name: "Anthropic", vendor: "anthropic", preset_key: "anthropic",
   channel: "default", protocol: "anthropic-messages", auth_mode: "apikey", base_url: "https://api.anthropic.com" };
+test("Sub2API keys show their upstream quota, spend and the retained-log totals", () => {
+  const relay: Provider = { ...sub2apiProvider, id: "sub2api-key", vendor: "sub2api", preset_key: "sub2api", channel: "openai",
+    api_key: "sk-relay" };
+  const quota: ProviderUsage = { ...base, provider_id: relay.id, kind: "sub2api_key", site: "global", is_available: true,
+    sub2api_quota: { amounts: { key_quota: { used_usd: 10, limit_usd: 40 } }, expires_at: "2030-02-01T00:00:00Z" },
+    tiers: [
+      { name: "five_hour", used_percent: 100, resets_at: "2030-01-01T05:00:00Z" },
+      { name: "key_quota", used_percent: 25, resets_at: null },
+    ],
+    spends: [{ name: "today", amount: 1.25, currency: "USD" }, { name: "total", amount: 10, currency: "USD" }],
+    scheduling: { status: "quota_exhausted", reason: "usage_limit", blocking_tiers: ["five_hour"],
+      reset_at: "2030-01-01T05:00:00Z", next_check_at: null },
+    api_price: sub2apiPrice };
+  const html = render(quota, undefined, relay);
+  match(html, />Sub2API Quota</);
+  match(html, /Quota exhausted, routing paused · 5h/);
+  match(html, />Key quota</);
+  match(html, /\$10(?:\.00)? \/ \$40(?:\.00)?/);
+  match(html, /Expires/);
+  match(html, />Today<[^]*\$1\.25[^]*>Total<[^]*\$10\.00/);
+  match(html, /data-local-usage="sub2api"/);
+  equal(priceValues(html), priceValues(render(sub2apiUsage, undefined, sub2apiProvider)));
+
+  const failedRefresh = render(quota, new Error("HTTP 503"), relay);
+  match(failedRefresh, /Usage query failed/);
+  doesNotMatch(failedRefresh, /routing paused/);
+
+  // Wallet mode: a balance row; an empty wallet reads unavailable.
+  const wallet = render({ ...quota, tiers: [], spends: [], is_available: false,
+    balances: [{ currency: "USD", total: 0, granted: 0, topped_up: 0 }],
+    scheduling: { status: "quota_exhausted", reason: "account_unavailable", blocking_tiers: [], reset_at: null, next_check_at: null } },
+    undefined, relay);
+  match(wallet, />Balance</);
+  match(wallet, /routing paused/);
+
+  // An older Sub2API without /v1/usage answers with local accounting instead.
+  const fallback = render({ ...sub2apiUsage, provider_id: relay.id }, undefined, relay);
+  match(fallback, />Sub2API Usage</);
+  match(fallback, /data-local-usage="sub2api"/);
+  doesNotMatch(fallback, /No usage data/);
+});
+
 const anthropicUsage: ProviderUsage = { ...sub2apiUsage, provider_id: anthropicProvider.id, kind: "anthropic_api" };
 
 test("Anthropic default-channel cards show the same local totals without upstream quota", () => {

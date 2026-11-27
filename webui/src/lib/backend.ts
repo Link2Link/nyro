@@ -141,6 +141,8 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "GET", url: `${base}/system/extensions` };
     case "create_provider":
       return { method: "POST", url: `${base}/providers`, body: args?.input as Record<string, unknown> };
+    case "detect_sub2api_platform":
+      return { method: "POST", url: `${base}/sub2api/detect-platform`, body: args?.input as Record<string, unknown> };
     case "copy_provider":
       return {
         method: "POST",

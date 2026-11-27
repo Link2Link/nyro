@@ -46,9 +46,527 @@
           "anthropic-messages": "bearer",
           "google-gemini": "bearer"
         },
-        "sharedKeyProtocols": true
+        "sharedKeyProtocols": true,
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/v1beta",
+            "/v1"
+          ]
+        }
       }
     ]
+  },
+  {
+    "channels": [
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "anthropic-messages",
+        "id": "anthropic",
+        "label": {
+          "en": "Anthropic",
+          "zh": "Anthropic"
+        },
+        "notes": {
+          "en": "Messages pass through natively. Groups restricted to Claude Code accept only Claude Code clients; Nyro converts other clients to Messages.",
+          "zh": "Messages 原生直通。分组开启「仅限 Claude Code」时只有 Claude Code 客户端可用；其他客户端由 Nyro 转换为 Messages。"
+        },
+        "optionalProtocols": [
+          "openai-compatible",
+          "openai-responses"
+        ],
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-responses",
+        "id": "openai",
+        "label": {
+          "en": "OpenAI",
+          "zh": "OpenAI"
+        },
+        "notes": {
+          "en": "Responses pass through natively (Codex contract and Fast tier apply). Anthropic Messages requires the group to allow /v1/messages dispatch.",
+          "zh": "Responses 原生直通（沿用 Codex 契约与 Fast 档）。勾选 Anthropic Messages 需要分组开启 /v1/messages 调度。"
+        },
+        "optionalProtocols": [
+          "openai-compatible",
+          "anthropic-messages"
+        ],
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "google-gemini": "",
+          "openai-compatible": ""
+        },
+        "defaultProtocol": "google-gemini",
+        "id": "gemini",
+        "label": {
+          "en": "Gemini",
+          "zh": "Gemini"
+        },
+        "notes": {
+          "en": "Gemini /v1beta passes through natively. Sub2API Gemini groups do not serve Responses; Nyro converts Responses clients to Gemini.",
+          "zh": "Gemini /v1beta 原生直通。Sub2API 的 Gemini 分组不提供 Responses，Responses 客户端由 Nyro 转换为 Gemini。"
+        },
+        "optionalProtocols": [
+          "anthropic-messages",
+          "openai-compatible"
+        ],
+        "relay": {
+          "modelsPath": "/v1beta/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "google-gemini": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "anthropic-messages",
+        "id": "antigravity",
+        "label": {
+          "en": "Antigravity",
+          "zh": "Antigravity"
+        },
+        "notes": {
+          "en": "Messages and Gemini use the dedicated /antigravity routes (Antigravity accounts only). Do not mix with the Anthropic platform in one conversation.",
+          "zh": "Messages 与 Gemini 走 /antigravity 专用路由（只调度 Antigravity 账号）。请勿与 Anthropic 平台在同一会话中混用。"
+        },
+        "optionalProtocols": [
+          "openai-compatible",
+          "openai-responses"
+        ],
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ],
+          "routePrefixes": {
+            "anthropic-messages": "/antigravity",
+            "google-gemini": "/antigravity"
+          }
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-responses",
+        "id": "grok",
+        "label": {
+          "en": "Grok",
+          "zh": "Grok"
+        },
+        "notes": {
+          "en": "Responses and Chat pass through natively; Nyro converts Claude Code requests to Responses by default.",
+          "zh": "Responses 与 Chat 原生直通；Claude Code 请求默认由 Nyro 转换为 Responses。"
+        },
+        "optionalProtocols": [
+          "anthropic-messages"
+        ],
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "kimi",
+        "label": {
+          "en": "Kimi",
+          "zh": "Kimi"
+        },
+        "notes": {
+          "en": "Chat, Messages and Responses pass through as-is; Sub2API picks the upstream endpoint per account or model.",
+          "zh": "Chat、Messages、Responses 同协议直通，由 Sub2API 按账号或模型选择上游端点。"
+        },
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "zhipu",
+        "label": {
+          "en": "Zhipu GLM",
+          "zh": "智谱 GLM"
+        },
+        "notes": {
+          "en": "Chat and Messages pass through natively; the upstream has no Responses endpoint, so Sub2API converts it when checked.",
+          "zh": "Chat 与 Messages 原生直通；上游没有 Responses，勾选后由 Sub2API 转换。"
+        },
+        "optionalProtocols": [
+          "openai-responses"
+        ],
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "deepseek",
+        "label": {
+          "en": "DeepSeek",
+          "zh": "DeepSeek"
+        },
+        "notes": {
+          "en": "Chat, Messages and Responses pass through as-is; Sub2API picks the upstream endpoint per account or model.",
+          "zh": "Chat、Messages、Responses 同协议直通，由 Sub2API 按账号或模型选择上游端点。"
+        },
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "minimax",
+        "label": {
+          "en": "MiniMax",
+          "zh": "MiniMax"
+        },
+        "notes": {
+          "en": "Chat, Messages and Responses pass through as-is; Sub2API picks the upstream endpoint per account or model.",
+          "zh": "Chat、Messages、Responses 同协议直通，由 Sub2API 按账号或模型选择上游端点。"
+        },
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "opencode_go",
+        "label": {
+          "en": "OpenCode",
+          "zh": "OpenCode"
+        },
+        "notes": {
+          "en": "Chat, Messages and Responses pass through as-is; Sub2API picks the upstream endpoint per account or model.",
+          "zh": "Chat、Messages、Responses 同协议直通，由 Sub2API 按账号或模型选择上游端点。"
+        },
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "command_code",
+        "label": {
+          "en": "Command Code",
+          "zh": "Command Code"
+        },
+        "notes": {
+          "en": "Chat, Messages and Responses pass through as-is; Sub2API picks the upstream endpoint per account or model.",
+          "zh": "Chat、Messages、Responses 同协议直通，由 Sub2API 按账号或模型选择上游端点。"
+        },
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "cline",
+        "label": {
+          "en": "Cline",
+          "zh": "Cline"
+        },
+        "notes": {
+          "en": "The upstream offers Chat Completions only; Nyro converts other protocols by default.",
+          "zh": "上游只有 Chat Completions；其他协议默认由 Nyro 转换。"
+        },
+        "optionalProtocols": [
+          "anthropic-messages",
+          "openai-responses"
+        ],
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      },
+      {
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer",
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer"
+        },
+        "baseUrls": {
+          "anthropic-messages": "",
+          "google-gemini": "",
+          "openai-compatible": "",
+          "openai-responses": ""
+        },
+        "defaultProtocol": "openai-compatible",
+        "id": "composite",
+        "label": {
+          "en": "Composite",
+          "zh": "组合分组"
+        },
+        "notes": {
+          "en": "All four protocols pass through; Sub2API resolves each model to its platform.",
+          "zh": "四种协议全部直通，由 Sub2API 按模型解析到具体平台。"
+        },
+        "relay": {
+          "modelsPath": "/v1/models",
+          "rootSuffixes": [
+            "/antigravity/v1beta",
+            "/antigravity/v1",
+            "/antigravity",
+            "/backend-api/codex",
+            "/v1beta",
+            "/v1"
+          ]
+        },
+        "sharedKeyProtocols": true
+      }
+    ],
+    "defaultProtocol": "openai-compatible",
+    "icon": "sub2api",
+    "id": "sub2api",
+    "label": {
+      "en": "Sub2API",
+      "zh": "Sub2API"
+    }
   },
   {
     "id": "openai",
@@ -74,13 +592,14 @@
       {
         "id": "sub2api",
         "label": {
-          "zh": "Sub2API",
-          "en": "Sub2API"
+          "zh": "Sub2API（旧版）",
+          "en": "Sub2API (legacy)"
         },
         "baseUrls": {
           "openai-responses": "https://sub2api.com/v1"
         },
-        "authMode": "apikey"
+        "authMode": "apikey",
+        "deprecated": true
       },
       {
         "id": "codex",

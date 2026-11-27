@@ -51,12 +51,13 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: None,
             shared_key_protocols: false,
             auth_schemes: None,
+            ..ChannelDef::DEFAULT
         },
         ChannelDef {
             id: "sub2api",
             label: Label {
-                zh: "Sub2API",
-                en: "Sub2API",
+                zh: "Sub2API（旧版）",
+                en: "Sub2API (legacy)",
             },
             base_urls: &[ProtocolBaseUrl {
                 protocol: "openai-responses",
@@ -71,6 +72,10 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: None,
             shared_key_protocols: false,
             auth_schemes: None,
+            // Superseded by the Sub2API preset (`sub2api/openai`); existing
+            // providers keep working through the shared platform classifier.
+            deprecated: true,
+            ..ChannelDef::DEFAULT
         },
         ChannelDef {
             id: "codex",
@@ -102,6 +107,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             }),
             shared_key_protocols: false,
             auth_schemes: None,
+            ..ChannelDef::DEFAULT
         },
     ],
 };

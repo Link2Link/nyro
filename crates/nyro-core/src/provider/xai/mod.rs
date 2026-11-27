@@ -57,6 +57,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: None,
             shared_key_protocols: false,
             auth_schemes: None,
+            ..ChannelDef::DEFAULT
         },
         ChannelDef {
             id: "grok",
@@ -105,6 +106,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             }),
             shared_key_protocols: false,
             auth_schemes: None,
+            ..ChannelDef::DEFAULT
         },
     ],
 };

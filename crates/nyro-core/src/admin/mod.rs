@@ -53,6 +53,8 @@ mod provider_api_price;
 mod providers;
 pub use provider_api_price::ProviderApiPriceStats;
 pub mod settings;
+mod sub2api;
+pub use sub2api::{Sub2ApiDetectConfidence, Sub2ApiDetectInput, Sub2ApiPlatformDetection};
 mod system_status;
 pub use system_status::{
     CpuStatus, DiskStatus, MemoryStatus, NetworkStatus, ProcessStatus, SystemStatus,

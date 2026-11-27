@@ -95,6 +95,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: None,
             shared_key_protocols: true,
             auth_schemes: Some(MIMO_ANTHROPIC_AUTH),
+            ..ChannelDef::DEFAULT
         },
         ChannelDef {
             id: "token-plan-cn",
@@ -125,6 +126,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: None,
             shared_key_protocols: true,
             auth_schemes: Some(MIMO_ANTHROPIC_AUTH),
+            ..ChannelDef::DEFAULT
         },
         ChannelDef {
             id: "token-plan-sgp",
@@ -155,6 +157,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: None,
             shared_key_protocols: true,
             auth_schemes: Some(MIMO_ANTHROPIC_AUTH),
+            ..ChannelDef::DEFAULT
         },
         ChannelDef {
             id: "token-plan-ams",
@@ -185,6 +188,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: None,
             shared_key_protocols: true,
             auth_schemes: Some(MIMO_ANTHROPIC_AUTH),
+            ..ChannelDef::DEFAULT
         },
     ],
 };

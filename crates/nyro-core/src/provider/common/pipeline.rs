@@ -24,12 +24,12 @@ use crate::error::GatewayError;
 use crate::protocol::ids::{OPENAI_RESPONSES_V1, Protocol, ProtocolId};
 use crate::provider::vendor::Vendor;
 
-/// ChatGPT 消费级上游渠道（codex OAuth 直连 / sub2api 中转）。sub2api
-/// 转发的仍是同一 chatgpt.com/backend-api/codex 消费级后端，出站体
-/// 改写（采样参数剥离、reasoning 无状态回放防御、工具调用 ID 规范化、
-/// Fast 模式注入）对两个渠道一致生效。
-fn is_codex_consumer_channel(channel: &str) -> bool {
-    channel.eq_ignore_ascii_case("codex") || channel.eq_ignore_ascii_case("sub2api")
+/// ChatGPT 消费级上游（codex OAuth 直连 / sub2api 中转，含 Sub2API 预设的
+/// OpenAI 平台）。sub2api 转发的仍是同一 chatgpt.com/backend-api/codex
+/// 消费级后端，出站体改写（采样参数剥离、reasoning 无状态回放防御、工具
+/// 调用 ID 规范化、Fast 模式注入）一致生效。
+fn is_codex_consumer(provider: &Provider) -> bool {
+    crate::provider::dialect::is_codex_consumer(provider)
 }
 
 /// Apply the configured speed on the OpenAI Responses wire body. Normal
@@ -41,17 +41,19 @@ pub(crate) fn apply_openai_speed_mode(body: &mut Value, provider: &Provider, pro
     apply_openai_speed_mode_for_protocol(
         body,
         provider.fast_mode,
-        provider.channel.as_deref(),
+        is_codex_consumer(provider),
         protocol.protocol,
     );
 }
 
+/// Forced service tier for a Codex consumer upstream (`codex_consumer`, see
+/// [`crate::provider::dialect::is_codex_consumer`]) on the Responses wire.
 pub(crate) fn openai_service_tier_override(
     fast_mode: OpenAiSpeedMode,
-    channel: Option<&str>,
+    codex_consumer: bool,
     protocol: Protocol,
 ) -> Option<&'static str> {
-    if protocol == Protocol::OpenAIResponses && channel.is_some_and(is_codex_consumer_channel) {
+    if protocol == Protocol::OpenAIResponses && codex_consumer {
         fast_mode.service_tier()
     } else {
         None
@@ -63,10 +65,10 @@ pub(crate) fn openai_service_tier_override(
 pub(crate) fn apply_openai_speed_mode_for_protocol(
     body: &mut Value,
     fast_mode: OpenAiSpeedMode,
-    channel: Option<&str>,
+    codex_consumer: bool,
     protocol: Protocol,
 ) {
-    if let Some(tier) = openai_service_tier_override(fast_mode, channel, protocol)
+    if let Some(tier) = openai_service_tier_override(fast_mode, codex_consumer, protocol)
         && let Some(object) = body.as_object_mut()
     {
         object.insert("service_tier".into(), Value::String(tier.into()));
@@ -79,11 +81,7 @@ pub(crate) fn apply_openai_speed_mode_for_protocol(
 /// 没有这些字段，OpenAI 自己的客户端不发它们）。原生直通与 IR 转码两条路径
 /// 转发前都需要剥离，否则上游返回 400 "Unsupported parameter: max_output_tokens"。
 pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: &Provider) {
-    let is_codex = provider
-        .channel
-        .as_deref()
-        .is_some_and(|channel| is_codex_consumer_channel(channel));
-    if !is_codex {
+    if !is_codex_consumer(provider) {
         return;
     }
     if let Some(object) = body.as_object_mut() {
@@ -232,11 +230,7 @@ fn is_native_codex_reasoning_id(id: &str) -> bool {
 }
 
 pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Provider) {
-    let is_codex = provider
-        .channel
-        .as_deref()
-        .is_some_and(|channel| is_codex_consumer_channel(channel));
-    if !is_codex {
+    if !is_codex_consumer(provider) {
         return;
     }
     let stateless = matches!(body.get("store"), Some(Value::Bool(false)));
@@ -300,11 +294,7 @@ pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Prov
 /// 配对——output 项通过 `call_id`（客户端↔模型配对键，中转轮自洽）
 /// 引用调用，不通过 `id`。`call_id` 与 output 的 id 保持原样。
 pub(crate) fn sanitize_codex_tool_call_ids(body: &mut Value, provider: &Provider) {
-    let is_codex = provider
-        .channel
-        .as_deref()
-        .is_some_and(|channel| is_codex_consumer_channel(channel));
-    if !is_codex {
+    if !is_codex_consumer(provider) {
         return;
     }
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
@@ -430,22 +420,17 @@ fn is_openai_effort_provider(provider: &Provider) -> bool {
     if crate::provider::nyro_gateway::is_nyro_gateway(provider) {
         return false;
     }
-    provider
-        .vendor
-        .as_deref()
-        .map(str::trim)
+    // Wire dialect, so Sub2API's OpenAI platform follows the OpenAI policy.
+    Some(crate::provider::dialect::wire_dialect_vendor(provider))
         .filter(|vendor| !vendor.is_empty())
         .or_else(|| provider.preset_key.as_deref().map(str::trim))
         .is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai"))
 }
 
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
-    let vendor_id = provider
-        .vendor
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or_default();
+    // The final hop's wire dialect: a Sub2API platform names its upstream
+    // (`sub2api/grok` follows the grok rules, `sub2api/opencode_go` OpenCode's).
+    let vendor_id = crate::provider::dialect::wire_dialect_vendor(provider);
     // Registered model policies use the actual wire model after route aliasing.
     // Custom relays may carry grok-* even without vendor=xai, but an explicit
     // OpenAI provider policy below wins over a misleading model name.

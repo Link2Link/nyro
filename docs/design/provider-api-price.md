@@ -10,7 +10,7 @@ These are reference estimates using recorded tokens and the current automatic or
 
 ## Retention and pricing
 
-**Sub2API** and the **Anthropic default channel** (API key, `anthropic_api`) have no upstream quota window. Their provider cards show retained upstream attempts, recorded tokens and API-equivalent prices for **All time** and **This month** only. This month starts at 00:00 UTC on the first calendar day and is capped at the time of the query. The admin view needs no upstream request or usage credentials; it does not project capacity or change routing eligibility.
+The **Anthropic default channel** (API key, `anthropic_api`) has no upstream quota window. A **Sub2API** provider with a single key (`sub2api_key`) shows the quota and spend Sub2API reports; with a key pool, no key, or an address without `/v1/usage` (`sub2api`) it has no upstream quota window either. These provider cards show retained upstream attempts, recorded tokens and API-equivalent prices for **All time** and **This month** (below the quota windows for `sub2api_key`). This month starts at 00:00 UTC on the first calendar day and is capped at the time of the query. The admin view needs no upstream request or usage credentials; it does not project capacity or change routing eligibility.
 
 The Anthropic match is identity-only: every recorded vendor/preset must be `anthropic` and the channel must be `default` (a blank legacy channel counts as `default`); relay Base URLs qualify. The Claude Code OAuth channel keeps its subscription usage. A Base URL that selects a vendor quota backend (for example GLM, Kimi or DeepSeek through their Anthropic-compatible endpoints) keeps that upstream view instead.
 
@@ -40,12 +40,12 @@ Only finite usage above 0% and at most 100%, with a priced sample from the same 
 
 ## Admin contract
 
-`GET /api/v1/providers/:id/usage`, the bulk admin usage listing, and the existing desktop `get_provider_usage` command share the optional `api_price` field for `glm_coding_plan`, `minimax_coding_plan`, `grok_plan`, `openai_codex`, `google_subscription`, `sub2api` and `anthropic_api`:
+`GET /api/v1/providers/:id/usage`, the bulk admin usage listing, and the existing desktop `get_provider_usage` command share the optional `api_price` field for `glm_coding_plan`, `minimax_coding_plan`, `grok_plan`, `openai_codex`, `google_subscription`, `sub2api`, `sub2api_key` and `anthropic_api`:
 
 | Field | Meaning |
 | --- | --- |
 | `all_time` | Retained totals: `total_tokens`, `request_count`, `equivalent_costs`, `unpriced_request_count`. |
-| `period` | The same totals within a known live reset cycle or the current calendar month for Sub2API / Anthropic API; otherwise `null`. |
+| `period` | The same totals within a known live reset cycle or the current calendar month for Sub2API (`sub2api` / `sub2api_key`) / Anthropic API; otherwise `null`. |
 | `period_start`, `period_end` | Epoch-millisecond, half-open bounds; otherwise `null`. |
 | `period_tier` | Selected canonical quota window, `calendar_month` for Sub2API / Anthropic API, or `null`. |
 | `used_percent` | Finite observed usage in `[0, 100]` for that window, or `null`. |

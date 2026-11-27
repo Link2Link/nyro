@@ -79,6 +79,10 @@ pub fn create_router_with_updater(
             get(request_log_attempts_handler),
         )
         .route("/providers/presets", get(list_provider_presets))
+        .route(
+            "/sub2api/detect-platform",
+            post(detect_sub2api_platform_handler),
+        )
         .route("/providers/usage", get(list_provider_usage_handler))
         .route(
             "/providers",
@@ -324,6 +328,16 @@ async fn create_provider_handler(
     Json(input): Json<CreateProvider>,
 ) -> impl IntoResponse {
     match gw.admin().create_provider(input).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn detect_sub2api_platform_handler(
+    State(gw): State<Gateway>,
+    Json(input): Json<nyro_core::admin::Sub2ApiDetectInput>,
+) -> impl IntoResponse {
+    match gw.admin().detect_sub2api_platform(input).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }

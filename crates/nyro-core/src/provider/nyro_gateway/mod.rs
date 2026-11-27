@@ -44,7 +44,7 @@ use crate::provider::common::pipeline;
 use crate::provider::inbound::InboundResponse;
 use crate::provider::metadata::{
     AuthMode, CapabilitiesSource, ChannelDef, Label, ProtocolAuthScheme, ProtocolBaseUrl,
-    VendorMetadata,
+    RelayAddressing, VendorMetadata,
 };
 use crate::provider::outbound::OutboundRequest;
 use crate::provider::registry::{VendorRegistration, VendorScope};
@@ -130,6 +130,12 @@ const METADATA: VendorMetadata = VendorMetadata {
         runtime: None,
         shared_key_protocols: true,
         auth_schemes: Some(AUTH_SCHEMES),
+        relay: Some(RelayAddressing {
+            models_path: "/v1/models",
+            route_prefixes: &[],
+            root_suffixes: &["/v1beta", "/v1"],
+        }),
+        ..ChannelDef::DEFAULT
     }],
 };
 

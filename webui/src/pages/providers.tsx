@@ -20,6 +20,7 @@ import type {
   TestResult,
   ProviderPreset,
   ProviderChannelPreset,
+  ProviderRelayAddressing,
   ProviderProtocol,
   ProviderEndpointAuthScheme,
   CreateProviderProtocolEndpoint,
@@ -98,7 +99,18 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
 import { DEVIN_PROTOCOL, KIRO_PROTOCOL, isDevinProvider, isKiroProvider, nativePresetProtocol, nativeProviderProtocol, hasProviderModelCatalog } from "@/lib/native-provider";
-import { applyNyroGatewayAddress, isNyroGatewayPreset, withNyroGatewayAddress } from "@/lib/nyro-gateway";
+import { isNyroGatewayPreset } from "@/lib/nyro-gateway";
+import { applyRelayAddress, relayModelsSource, relayRoute, withRelayAddress } from "@/lib/relay-address";
+import {
+  detectionKey,
+  isSub2ApiPreset,
+  platformLabel,
+  platformMismatch,
+  sub2apiHintText,
+  type Sub2ApiDetectionState,
+} from "@/lib/sub2api";
+import { detectSub2ApiPlatform } from "@/lib/sub2api-detect";
+import { Sub2ApiPlatformDetect } from "@/components/sub2api-platform-detect";
 
 function protocolUrl(protocol: string) {
   return PROTOCOL_TABLE.find((p) => p.id === resolveProtocol(protocol))?.defaultBaseUrl
@@ -411,6 +423,8 @@ interface SharedKeyProtocolEntry {
   protocol: ProviderProtocol;
   baseUrl: string;
   authScheme: ProviderEndpointAuthScheme;
+  /** Offered unchecked: usable, but not part of the channel's recommended set. */
+  optional: boolean;
 }
 
 function presetSharedKeyChannel(
@@ -434,6 +448,9 @@ function channelAuthScheme(
 
 function sharedKeyProtocolEntries(channel: ProviderChannelPreset): SharedKeyProtocolEntry[] {
   const known = new Set<ProviderProtocol>(protocolOptions.map((item) => item.value));
+  const optional = new Set<string>(
+    (channel.optionalProtocols ?? []).map((key) => resolveProtocol(key) ?? key),
+  );
   return Object.entries(channel.baseUrls ?? {})
     .map(([key, baseUrl]) => {
       const protocol = resolveProtocol(key) as ProviderProtocol | null;
@@ -442,17 +459,27 @@ function sharedKeyProtocolEntries(channel: ProviderChannelPreset): SharedKeyProt
             protocol,
             baseUrl: toGatewayBaseUrl(baseUrl),
             authScheme: channelAuthScheme(channel, protocol),
+            optional: optional.has(protocol),
           }
         : null;
     })
     .filter((entry): entry is SharedKeyProtocolEntry => entry !== null);
 }
 
+/** Point picker entries of a relay channel (Nyro, Sub2API) at the typed address. */
+function relayEntries(channel: ProviderChannelPreset, address: string): SharedKeyProtocolEntry[] {
+  const entries = sharedKeyProtocolEntries(channel);
+  return channel.relay ? withRelayAddress(entries, address, channel.relay) : entries;
+}
+
+/** Seed one endpoint per recommended (non-optional) protocol; optional ones start unchecked. */
 function seedSharedKeyEndpoints(
-  entries: SharedKeyProtocolEntry[],
+  allEntries: SharedKeyProtocolEntry[],
   apiKey: string,
   defaultProtocolHint?: string,
 ): { endpoints: CreateProviderProtocolEndpoint[]; defaultProtocol: string } {
+  const recommended = allEntries.filter((entry) => !entry.optional);
+  const entries = recommended.length ? recommended : allEntries;
   const endpoints = entries.map((entry, index) => ({
     protocol: endpointOption(entry.protocol).id,
     base_url: entry.baseUrl,
@@ -476,12 +503,15 @@ function SharedKeyProtocolPicker({
   endpoints,
   defaultProtocol,
   isZh,
+  relay,
   onChange,
 }: {
   entries: SharedKeyProtocolEntry[];
   endpoints: CreateProviderProtocolEndpoint[];
   defaultProtocol: string;
   isZh: boolean;
+  /** Relay channels preview each protocol's final route (root + prefix + path). */
+  relay?: ProviderRelayAddressing;
   onChange: (endpoints: CreateProviderProtocolEndpoint[], defaultProtocol: string) => void;
 }) {
   const enabled = endpoints.filter((endpoint) => endpoint.is_enabled !== false);
@@ -534,6 +564,7 @@ function SharedKeyProtocolPicker({
             const existing = endpoints.find((endpoint) => endpoint.protocol === endpointId);
             const checked = Boolean(existing);
             const baseUrl = existing?.base_url || entry.baseUrl;
+            const route = relay ? relayRoute(baseUrl, relay, entry.protocol) : baseUrl;
             return (
               <label
                 key={entry.protocol}
@@ -545,11 +576,14 @@ function SharedKeyProtocolPicker({
                   className="mt-0.5"
                 />
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium text-slate-800">
+                  <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
                     {endpointDisplayName(endpointId)}
+                    {entry.optional && (
+                      <span className="text-xs font-normal text-slate-400">{isZh ? "可选" : "Optional"}</span>
+                    )}
                   </div>
-                  <div className="mt-0.5 truncate text-xs text-slate-500" title={baseUrl}>
-                    {baseUrl}
+                  <div className="mt-0.5 truncate text-xs text-slate-500" title={route}>
+                    {route}
                   </div>
                 </div>
                 {defaultProtocol === endpointId && checked && (
@@ -582,29 +616,51 @@ function SharedKeyProtocolPicker({
   );
 }
 
-/** Remote address for the Nyro preset: one origin serves every checked protocol. */
-function NyroGatewayAddressField({
+/** Copy for a relay preset's address field (Nyro chain, Sub2API, other relays). */
+function relayAddressCopy(presetId: string | undefined, isZh: boolean) {
+  if (isNyroGatewayPreset(presetId)) {
+    return {
+      label: isZh ? "Nyro 地址" : "Nyro Address",
+      placeholder: "http://<nyro-host>:19530",
+      info: isZh
+        ? "另一个 Nyro 实例的代理地址（默认端口 19530），所有勾选的协议共用该地址，可省略 /v1。API Key 填写对端的 NYRO_PROXY_AUTH_KEY 或对端创建的 API Key。"
+        : "Proxy address of the other Nyro instance (default port 19530), shared by every checked protocol; /v1 is optional. Use the remote's NYRO_PROXY_AUTH_KEY or an API key created on it.",
+    };
+  }
+  if (isSub2ApiPreset(presetId)) {
+    return {
+      label: isZh ? "Sub2API 地址" : "Sub2API Address",
+      placeholder: "https://<sub2api-host>",
+      info: isZh
+        ? "Sub2API 站点根地址，所有勾选的协议共用该地址；可直接粘贴带 /v1、/v1beta 或 /antigravity 的地址，保存时自动规范化。API Key 填写在 Sub2API 中创建、绑定所选平台分组的 Key。"
+        : "Root address of the Sub2API site, shared by every checked protocol. Addresses ending in /v1, /v1beta or /antigravity can be pasted as-is and are normalized on save. Use a Sub2API API key bound to a group of the selected platform.",
+    };
+  }
+  return {
+    label: isZh ? "中转地址" : "Relay Address",
+    placeholder: "https://<relay-host>",
+    info: isZh ? "所有勾选的协议共用该地址。" : "Shared by every checked protocol.",
+  };
+}
+
+/** Relay address (Nyro chain, Sub2API): one origin serves every checked protocol. */
+function RelayAddressField({
+  presetId,
   value,
   isZh,
   onChange,
 }: {
+  presetId?: string;
   value: string;
   isZh: boolean;
   onChange: (address: string) => void;
 }) {
+  const copy = relayAddressCopy(presetId, isZh);
   return (
     <div className="col-span-2 space-y-2">
-      <FieldLabel
-        info={
-          isZh
-            ? "另一个 Nyro 实例的代理地址（默认端口 19530），所有勾选的协议共用该地址，可省略 /v1。API Key 填写对端的 NYRO_PROXY_AUTH_KEY 或对端创建的 API Key。"
-            : "Proxy address of the other Nyro instance (default port 19530), shared by every checked protocol; /v1 is optional. Use the remote's NYRO_PROXY_AUTH_KEY or an API key created on it."
-        }
-      >
-        {isZh ? "Nyro 地址" : "Nyro Address"}
-      </FieldLabel>
+      <FieldLabel info={copy.info}>{copy.label}</FieldLabel>
       <Input
-        placeholder="http://<nyro-host>:19530"
+        placeholder={copy.placeholder}
         value={value}
         autoCapitalize="none"
         autoCorrect="off"
@@ -675,7 +731,12 @@ function resolvePresetProtocol(
   preferred?: ProviderProtocol,
 ): ProviderProtocol {
   const available = availableProtocolsForPreset(preset, channelId);
-  const canonicalDefault = nativePresetProtocol(preset) ?? (resolveProtocol(preset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol;
+  const channelDefault = resolveProtocol(
+    preset.channels?.find((channel) => channel.id === channelId)?.defaultProtocol,
+  ) as ProviderProtocol | null;
+  const canonicalDefault = nativePresetProtocol(preset)
+    ?? channelDefault
+    ?? (resolveProtocol(preset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol;
   if (preferred && available.includes(preferred)) return preferred;
   if (available.includes(canonicalDefault)) return canonicalDefault;
   return available[0] ?? canonicalDefault;
@@ -768,6 +829,32 @@ function fallbackProviderPreset(): ProviderPreset {
 
 function presetChannels(preset?: ProviderPreset | null) {
   return preset?.channels?.length ? preset.channels : [fallbackChannelPreset()];
+}
+
+/** Channels offered when creating a provider: deprecated ones stay editable only. */
+function creatablePresetChannels(preset?: ProviderPreset | null) {
+  const channels = presetChannels(preset);
+  const current = channels.filter((channel) => !channel.deprecated);
+  return current.length ? current : channels;
+}
+
+/**
+ * Protocol to aim for when a channel is (re)selected: a channel-declared default (Sub2API
+ * platforms) wins; otherwise the caller's previous preference is passed through as-is.
+ */
+function channelPreferredProtocol(
+  preset: ProviderPreset,
+  channelId: string,
+  fallback?: ProviderProtocol,
+): ProviderProtocol | undefined {
+  const declared = preset.channels?.find((channel) => channel.id === channelId)?.defaultProtocol;
+  if (declared) return (resolveProtocol(declared) ?? declared) as ProviderProtocol;
+  return fallback;
+}
+
+/** The selected channel of a preset, if declared. */
+function findPresetChannel(preset: ProviderPreset | null | undefined, channelId?: string | null) {
+  return preset?.channels?.find((channel) => channel.id === channelId) ?? null;
 }
 
 function presetChannelAuthMode(
@@ -943,6 +1030,17 @@ export default function ProvidersPage() {
   const [showCreateApiKey, setShowCreateApiKey] = useState(true);
   const [showEditApiKey, setShowEditApiKey] = useState(false);
   const [errorDialog, setErrorDialog] = useState<{ title: string; description?: string } | null>(null);
+  // Sub2API platform detection per form, plus the save-time mismatch prompt.
+  const [createSub2ApiDetection, setCreateSub2ApiDetection] = useState<Sub2ApiDetectionState | null>(null);
+  const [editSub2ApiDetection, setEditSub2ApiDetection] = useState<Sub2ApiDetectionState | null>(null);
+  const [sub2apiChecking, setSub2ApiChecking] = useState(false);
+  const sub2apiSaveAttempt = useRef(0);
+  const [sub2apiMismatch, setSub2ApiMismatch] = useState<{
+    detected: string;
+    selected: string;
+    confidence: Sub2ApiDetectionState["result"]["confidence"];
+    proceed: () => void;
+  } | null>(null);
   const createOAuth = useOAuthSession();
   const { session: createOAuthSession, status: createOAuthStatus, busy: createOAuthBusy } = createOAuth;
   const [createOAuthCallbackUrl, setCreateOAuthCallbackUrl] = useState("");
@@ -1389,7 +1487,7 @@ export default function ProvidersPage() {
         } else {
           appendTestLog(
             "error",
-            `${isZh ? "✗ 端点失败" : "✗ Endpoint failed"} [${endpointDisplayName(endpoint.protocol)}]: ${endpoint.error ?? (isZh ? "连接失败" : "Connection failed")}`,
+            `${isZh ? "✗ 端点失败" : "✗ Endpoint failed"} [${endpointDisplayName(endpoint.protocol)}]: ${sub2apiHintText(endpoint.error ?? (isZh ? "连接失败" : "Connection failed"), isZh)}`,
           );
         }
       });
@@ -1615,7 +1713,7 @@ export default function ProvidersPage() {
         } else {
           appendTestLog(
             "error",
-            `✗ ${result.model} [${protocolLabel}]${quotaLabel}: ${result.error ?? (isZh ? "调用失败" : "call failed")}`,
+            `✗ ${result.model} [${protocolLabel}]${quotaLabel}: ${sub2apiHintText(result.error ?? (isZh ? "调用失败" : "call failed"), isZh)}`,
           );
         }
       }
@@ -1686,6 +1784,10 @@ export default function ProvidersPage() {
   }
 
   function closeEditForm() {
+    sub2apiSaveAttempt.current++;
+    setSub2ApiChecking(false);
+    setSub2ApiMismatch(null);
+    setEditSub2ApiDetection(null);
     resetEditOAuthState();
     setShowEditReauth(false);
     setEditingId(null);
@@ -1742,10 +1844,8 @@ export default function ProvidersPage() {
     // with one endpoint per checked protocol sharing the provider API key.
     const sharedChannel = presetForEdit ? presetSharedKeyChannel(presetForEdit, channel) : null;
     if (sharedChannel) {
-      // The Nyro preset ships no address; reseed missing endpoints from the saved one.
-      const entries = isNyroGatewayPreset(presetForEdit?.id)
-        ? withNyroGatewayAddress(sharedKeyProtocolEntries(sharedChannel), p.base_url ?? "")
-        : sharedKeyProtocolEntries(sharedChannel);
+      // Relay presets (Nyro, Sub2API) ship no address; reseed missing endpoints from the saved one.
+      const entries = relayEntries(sharedChannel, p.base_url ?? "");
       const savedEndpointId = endpointOption(p.protocol || safeProtocol).id;
       const existing = (p.protocol_endpoints ?? [])
         .filter((endpoint) =>
@@ -1781,7 +1881,7 @@ export default function ProvidersPage() {
         protocol_mode: "adaptive",
         protocol_endpoints: endpoints,
         use_proxy: p.use_proxy,
-        fast_mode: speedModeForChannel(channel, p.fast_mode),
+        fast_mode: speedModeForChannel(channel, p.fast_mode, p.preset_key || presetForEdit?.id),
         preset_key: p.preset_key || presetForEdit?.id || DEFAULT_PRESET_ID,
         channel,
         models_source: p.models_source ?? "",
@@ -1808,7 +1908,7 @@ export default function ProvidersPage() {
         priority: endpoint.priority,
       })),
       use_proxy: p.use_proxy,
-      fast_mode: speedModeForChannel(channel, p.fast_mode),
+      fast_mode: speedModeForChannel(channel, p.fast_mode, p.preset_key || presetForEdit?.id),
       preset_key: p.preset_key || presetForEdit?.id || DEFAULT_PRESET_ID,
       channel,
       models_source: p.models_source ?? "",
@@ -1826,8 +1926,16 @@ export default function ProvidersPage() {
     const preset = providerPresets.find((item) => item.id === nextPresetId);
     if (!preset) return;
 
-    const nextChannelId = preset.channels?.[0]?.id ?? "";
-    const nextProtocol = resolvePresetProtocol(preset, nextChannelId, (resolveProtocol(preset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol);
+    const nextChannelId = preset.channels?.length ? (creatablePresetChannels(preset)[0]?.id ?? "") : "";
+    const nextProtocol = resolvePresetProtocol(
+      preset,
+      nextChannelId,
+      channelPreferredProtocol(
+        preset,
+        nextChannelId,
+        (resolveProtocol(preset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol,
+      ),
+    );
     const config = resolvePresetConfig(preset, nextProtocol, nextChannelId);
     const nextBaseUrl = config.baseUrl || protocolUrl(nextProtocol);
 
@@ -1879,16 +1987,22 @@ export default function ProvidersPage() {
     const nextProtocol = resolvePresetProtocol(
       selectedPreset,
       nextChannelId,
-      form.protocol as ProviderProtocol,
+      channelPreferredProtocol(selectedPreset, nextChannelId, form.protocol as ProviderProtocol),
     );
     const config = resolvePresetConfig(selectedPreset, nextProtocol, nextChannelId);
     const nextBaseUrl = config.baseUrl || protocolUrl(nextProtocol);
 
-    const channelFields = { channel: nextChannelId, fast_mode: speedModeForChannel(nextChannelId, form.fast_mode) };
+    const channelFields = {
+      channel: nextChannelId,
+      fast_mode: speedModeForChannel(nextChannelId, form.fast_mode, selectedPreset.id),
+    };
     const nextSharedChannel = presetSharedKeyChannel(selectedPreset, nextChannelId);
     if (nextSharedChannel && nextAuthMode === "apikey") {
+      // Relay platforms (Sub2API) keep the typed address across channel switches.
+      const relay = nextSharedChannel.relay;
+      const address = relay ? (form.base_url ?? "") : "";
       const seeded = seedSharedKeyEndpoints(
-        sharedKeyProtocolEntries(nextSharedChannel),
+        relayEntries(nextSharedChannel, address),
         form.api_key,
         endpointOption(nextProtocol).id,
       );
@@ -1898,9 +2012,11 @@ export default function ProvidersPage() {
         protocol: seeded.defaultProtocol,
         protocol_mode: "adaptive",
         protocol_endpoints: seeded.endpoints,
-        base_url: seeded.endpoints.find((endpoint) => endpoint.protocol === seeded.defaultProtocol)?.base_url ?? prev.base_url,
+        base_url: relay
+          ? address
+          : seeded.endpoints.find((endpoint) => endpoint.protocol === seeded.defaultProtocol)?.base_url ?? prev.base_url,
         auth_mode: nextAuthMode,
-        models_source: config.modelsSource,
+        models_source: relay ? relayModelsSource(address, relay) : config.modelsSource,
         static_models: config.staticModels,
       }));
       return;
@@ -1947,7 +2063,7 @@ export default function ProvidersPage() {
     const preset = providerPresets.find((item) => item.id === nextPresetId);
     if (!preset) return;
 
-    const nextChannelId = preset.channels?.[0]?.id ?? "";
+    const nextChannelId = preset.channels?.length ? (creatablePresetChannels(preset)[0]?.id ?? "") : "";
     const nextAuthMode = presetChannelAuthMode(preset, nextChannelId);
     if (nextAuthMode === "oauth" && normalizeAuthMode(editingProvider?.auth_mode) !== "oauth") {
       setEditError(
@@ -1991,7 +2107,55 @@ export default function ProvidersPage() {
     );
   }
 
+  /**
+   * Save-time platform check for Sub2API providers: reuse the detection for
+   * this address + key or run one; a confident disagreement asks first.
+   * Detection failures never block saving (the connection test reports them).
+   */
+  async function confirmSub2ApiPlatform(options: {
+    address: string;
+    apiKey: string;
+    useProxy: boolean;
+    channel: string;
+    channels: ProviderChannelPreset[];
+    cached: Sub2ApiDetectionState | null;
+    remember: (state: Sub2ApiDetectionState) => void;
+    proceed: () => void;
+  }) {
+    const attempt = ++sub2apiSaveAttempt.current;
+    const { address, apiKey, useProxy, channel, channels, cached, remember, proceed } = options;
+    let detection = cached?.key === detectionKey(address, apiKey) ? cached.result : null;
+    if (!detection && address.trim() && apiKey.trim()) {
+      setSub2ApiChecking(true);
+      try {
+        const state = await detectSub2ApiPlatform(address, apiKey, useProxy);
+        if (attempt !== sub2apiSaveAttempt.current) return;
+        remember(state);
+        detection = state.result;
+      } catch {
+        detection = null;
+      } finally {
+        if (attempt === sub2apiSaveAttempt.current) setSub2ApiChecking(false);
+      }
+    }
+    if (attempt !== sub2apiSaveAttempt.current) return;
+    if (detection?.platform && platformMismatch(detection, channel)) {
+      setSub2ApiMismatch({
+        detected: platformLabel(channels, detection.platform, isZh),
+        selected: platformLabel(channels, channel, isZh),
+        confidence: detection.confidence,
+        proceed,
+      });
+      return;
+    }
+    proceed();
+  }
+
   function closeCreateForm() {
+    sub2apiSaveAttempt.current++;
+    setSub2ApiChecking(false);
+    setSub2ApiMismatch(null);
+    setCreateSub2ApiDetection(null);
     resetCreateOAuthState(true);
     setCreateKiroLogin({ method: "google" });
     setShowForm(false);
@@ -2000,7 +2164,7 @@ export default function ProvidersPage() {
     setForm(emptyCreate);
   }
 
-  const createChannelOptions = selectedPreset ? presetChannels(selectedPreset) : [fallbackChannelPreset()];
+  const createChannelOptions = selectedPreset ? creatablePresetChannels(selectedPreset) : [fallbackChannelPreset()];
   const createChannelValue =
     selectedPreset?.channels?.length
       ? (form.channel || createChannelOptions[0]?.id || "")
@@ -2015,12 +2179,12 @@ export default function ProvidersPage() {
   const createIsSharedKey = createResolvedAuthMode === "apikey"
     && createSharedKeyChannel !== null
     && !createUsesVertexServiceAccount;
-  const createIsNyroGateway = createIsSharedKey && isNyroGatewayPreset(selectedPreset?.id);
+  // Relay presets (Nyro chain, Sub2API): one typed address serves every protocol.
+  const createRelay = createIsSharedKey ? createSharedKeyChannel?.relay : undefined;
   const createSharedKeyEntries = createSharedKeyChannel
-    ? (createIsNyroGateway
-      ? withNyroGatewayAddress(sharedKeyProtocolEntries(createSharedKeyChannel), form.base_url ?? "")
-      : sharedKeyProtocolEntries(createSharedKeyChannel))
+    ? relayEntries(createSharedKeyChannel, form.base_url ?? "")
     : [];
+  const createChannelNotes = findPresetChannel(selectedPreset, createChannelValue)?.notes;
   const createOAuthReady = createOAuthStatus?.status === "ready";
   const createIsDevinOAuth = isDevinProvider(form);
   const createIsKiroOAuth = isKiroProvider(form);
@@ -2203,7 +2367,12 @@ export default function ProvidersPage() {
                   ))}
                 </ToggleGroup>
               </div>
-              <ProviderSpeedMode channel={createChannelValue} value={form.fast_mode} isZh={isZh}
+              {createChannelNotes && (
+                <p className="col-span-2 -mt-2 text-xs leading-relaxed text-slate-500">
+                  {isZh ? createChannelNotes.zh : createChannelNotes.en}
+                </p>
+              )}
+              <ProviderSpeedMode channel={createChannelValue} presetId={selectedPreset?.id} value={form.fast_mode} isZh={isZh}
                 onChange={(mode) => setForm({ ...form, fast_mode: mode })} className="col-span-2 space-y-2" />
               {createIsDevinOAuth && <>
                 <p className="col-span-2 text-xs text-slate-500">{isZh
@@ -2627,11 +2796,25 @@ export default function ProvidersPage() {
                   })}
                 />
               )}
-              {createResolvedAuthMode !== "oauth" && createIsNyroGateway && (
-                <NyroGatewayAddressField
+              {createResolvedAuthMode !== "oauth" && createRelay && (
+                <RelayAddressField
+                  presetId={selectedPreset?.id}
                   value={form.base_url ?? ""}
                   isZh={isZh}
-                  onChange={(address) => setForm(applyNyroGatewayAddress(form, address))}
+                  onChange={(address) => setForm(applyRelayAddress(form, address, createRelay))}
+                />
+              )}
+              {createResolvedAuthMode !== "oauth" && createRelay && isSub2ApiPreset(selectedPreset?.id) && (
+                <Sub2ApiPlatformDetect
+                  address={form.base_url ?? ""}
+                  apiKey={form.api_key}
+                  useProxy={Boolean(form.use_proxy)}
+                  channel={createChannelValue}
+                  channels={createChannelOptions}
+                  detection={createSub2ApiDetection}
+                  onDetected={setCreateSub2ApiDetection}
+                  onApply={(platform) => handlePresetChannelChange(platform)}
+                  isZh={isZh}
                 />
               )}
               {createResolvedAuthMode !== "oauth" && createIsSharedKey && (
@@ -2640,6 +2823,7 @@ export default function ProvidersPage() {
                   endpoints={form.protocol_endpoints ?? []}
                   defaultProtocol={form.protocol}
                   isZh={isZh}
+                  relay={createRelay}
                   onChange={(protocolEndpoints, defaultProtocol) => {
                     const defaultEndpoint = protocolEndpoints.find(
                       (endpoint) => endpoint.protocol === defaultProtocol,
@@ -2708,7 +2892,7 @@ export default function ProvidersPage() {
                     }
                     const input: CreateProvider = {
                       ...form,
-                      fast_mode: speedModeForChannel(createChannelValue, form.fast_mode),
+                      fast_mode: speedModeForChannel(createChannelValue, form.fast_mode, selectedPreset?.id),
                       protocol,
                       base_url: baseUrl,
                       api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : form.api_key,
@@ -2726,24 +2910,40 @@ export default function ProvidersPage() {
                       createOAuthMut.mutate({ sessionId, input });
                       return;
                     }
+                    if (isSub2ApiPreset(selectedPreset?.id)) {
+                      void confirmSub2ApiPlatform({
+                        address: form.base_url ?? "",
+                        apiKey: form.api_key,
+                        useProxy: Boolean(form.use_proxy),
+                        channel: createChannelValue,
+                        channels: createChannelOptions,
+                        cached: createSub2ApiDetection,
+                        remember: setCreateSub2ApiDetection,
+                        proceed: () => createMut.mutate(input),
+                      });
+                      return;
+                    }
                     createMut.mutate(input);
                   }}
                   disabled={
                     createMut.isPending
                     || createOAuthMut.isPending
+                    || sub2apiChecking
                     || !form.name.trim()
                     || (createResolvedAuthMode === "apikey"
                       && (form.protocol_mode !== "adaptive" || createIsSharedKey)
                       && !form.api_key)
                     || (form.protocol_mode === "adaptive"
                       && !(form.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
-                    || (createIsNyroGateway && !(form.base_url ?? "").trim())
+                    || (createRelay !== undefined && !(form.base_url ?? "").trim())
                     || (createResolvedAuthMode === "oauth" && !createOAuthReady)
                   }
                 >
-                  {(createMut.isPending || createOAuthMut.isPending)
-                    ? (isZh ? "创建中..." : "Creating...")
-                    : (isZh ? "创建" : "Create")}
+                  {sub2apiChecking
+                    ? (isZh ? "检查平台中..." : "Checking platform...")
+                    : (createMut.isPending || createOAuthMut.isPending)
+                      ? (isZh ? "创建中..." : "Creating...")
+                      : (isZh ? "创建" : "Create")}
                 </Button>
               <Button
                 onClick={closeCreateForm}
@@ -2837,7 +3037,9 @@ export default function ProvidersPage() {
                 }];
 
             if (isEditing) {
-              const editingChannelOptions = presetChannels(editingPreset);
+              // Deprecated channels stay selectable only for providers already on them.
+              const editingChannelOptions = presetChannels(editingPreset)
+                .filter((channel) => !channel.deprecated || channel.id === p.channel);
               const editingChannelValue =
                 editingPreset?.channels?.length
                   ? (editForm.channel || editingChannelOptions[0]?.id || "")
@@ -2854,12 +3056,11 @@ export default function ProvidersPage() {
               const editingIsSharedKey = editingResolvedAuthMode === "apikey"
                 && editingSharedKeyChannel !== null
                 && !editUsesVertexServiceAccount;
-              const editingIsNyroGateway = editingIsSharedKey && isNyroGatewayPreset(editingPreset?.id);
+              const editingRelay = editingIsSharedKey ? editingSharedKeyChannel?.relay : undefined;
               const editingSharedKeyEntries = editingSharedKeyChannel
-                ? (editingIsNyroGateway
-                  ? withNyroGatewayAddress(sharedKeyProtocolEntries(editingSharedKeyChannel), editForm.base_url ?? "")
-                  : sharedKeyProtocolEntries(editingSharedKeyChannel))
+                ? relayEntries(editingSharedKeyChannel, editForm.base_url ?? "")
                 : [];
+              const editingChannelNotes = findPresetChannel(editingPreset, editingChannelValue)?.notes;
               const editingProviderIsArk = p.base_url.toLowerCase().includes("volces.com");
               const editingProviderIsDeepSeek = p.base_url.toLowerCase().includes("api.deepseek.com");
               const editingProviderIsBailian = p.base_url.toLowerCase().includes("token-plan.");
@@ -2869,6 +3070,95 @@ export default function ProvidersPage() {
                 || normalizeAuthMode(editForm.auth_mode) === "oauth";
               const editRequiresNewOAuthProvider = editingResolvedAuthMode === "oauth" && !currentProviderIsOAuth;
               const editOAuthStatus = editOAuthStatusQuery.data;
+              const changeEditChannel = (value: string) => {
+              if (!value || !editingPreset?.channels?.length) return;
+              resetEditOAuthState();
+              setShowEditReauth(false);
+              const nextAuthMode = presetChannelAuthMode(editingPreset, value);
+              if (nextAuthMode === "oauth" && !currentProviderIsOAuth) {
+                setEditError(
+                  isZh
+                    ? "已有 Provider 不能在编辑时直接切到 OAuth 渠道，请新建一个 OAuth Provider。"
+                    : "Existing providers cannot switch directly to an OAuth channel while editing. Create a new OAuth provider instead.",
+                );
+                return;
+              }
+              const resolvedProtocol = resolvePresetProtocol(
+                editingPreset,
+                value,
+                channelPreferredProtocol(
+                  editingPreset,
+                  value,
+                  (editForm.protocol as ProviderProtocol)
+                    || (resolveProtocol(editingPreset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol,
+                ),
+              );
+              const config = resolvePresetConfig(
+                editingPreset,
+                resolvedProtocol,
+                value,
+              );
+              const nextBaseUrl = config.baseUrl || protocolUrl(resolvedProtocol);
+              const baseUrl = editUsesVertexServiceAccount
+                ? (nextBaseUrl || defaultVertexBaseUrl(resolvedProtocol))
+                : nextBaseUrl;
+              setEditError(null);
+              const channelFields = {
+                channel: value,
+                fast_mode: speedModeForChannel(value, editForm.fast_mode, editingPreset.id),
+              };
+              const nextSharedChannel = presetSharedKeyChannel(editingPreset, value);
+              if (nextSharedChannel && nextAuthMode === "apikey" && !editUsesVertexServiceAccount) {
+                // Relay platforms (Sub2API) keep the saved address across channel switches.
+                const relay = nextSharedChannel.relay;
+                const address = relay ? (editForm.base_url ?? "") : "";
+                const seeded = seedSharedKeyEndpoints(
+                  relayEntries(nextSharedChannel, address),
+                  editForm.api_key ?? "",
+                  endpointOption(resolvedProtocol).id,
+                );
+                setEditForm({
+                  ...editForm,
+                  ...channelFields,
+                  auth_mode: nextAuthMode,
+                  protocol_mode: "adaptive",
+                  protocol: seeded.defaultProtocol,
+                  protocol_endpoints: seeded.endpoints,
+                  base_url: relay
+                    ? address
+                    : seeded.endpoints.find((endpoint) => endpoint.protocol === seeded.defaultProtocol)?.base_url ?? baseUrl,
+                  models_source: relay ? relayModelsSource(address, relay) : config.modelsSource,
+                  static_models: config.staticModels,
+                });
+                return;
+              }
+              if (
+                editForm.protocol_mode === "adaptive"
+                && nextAuthMode === "apikey"
+                && !editUsesVertexServiceAccount
+                && presetSharedKeyChannel(editingPreset, editForm.channel) === null
+              ) {
+                setEditForm({
+                  ...editForm,
+                  ...channelFields,
+                  auth_mode: nextAuthMode,
+                  models_source: config.modelsSource,
+                  static_models: config.staticModels,
+                });
+                return;
+              }
+              setEditForm({
+                ...editForm,
+                ...channelFields,
+                protocol: resolvedProtocol,
+                protocol_mode: "fixed",
+                protocol_endpoints: [],
+                auth_mode: nextAuthMode,
+                base_url: baseUrl,
+                models_source: config.modelsSource,
+                static_models: config.staticModels,
+              });
+              };
               return (
                 <div key={p.id} id={`provider-row-${p.id}`} className="p-4 sm:p-5 space-y-4">
                   <div className="flex items-center justify-between">
@@ -2937,82 +3227,7 @@ export default function ProvidersPage() {
                       <ToggleGroup
                         type="single"
                         value={editingChannelValue}
-                        onValueChange={(value) => {
-                          if (!value || !editingPreset?.channels?.length) return;
-                          resetEditOAuthState();
-                          setShowEditReauth(false);
-                          const nextAuthMode = presetChannelAuthMode(editingPreset, value);
-                          if (nextAuthMode === "oauth" && !currentProviderIsOAuth) {
-                            setEditError(
-                              isZh
-                                ? "已有 Provider 不能在编辑时直接切到 OAuth 渠道，请新建一个 OAuth Provider。"
-                                : "Existing providers cannot switch directly to an OAuth channel while editing. Create a new OAuth provider instead.",
-                            );
-                            return;
-                          }
-                          const resolvedProtocol = resolvePresetProtocol(
-                            editingPreset,
-                            value,
-                            (editForm.protocol as ProviderProtocol) || (resolveProtocol(editingPreset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol,
-                          );
-                          const config = resolvePresetConfig(
-                            editingPreset,
-                            resolvedProtocol,
-                            value,
-                          );
-                          const nextBaseUrl = config.baseUrl || protocolUrl(resolvedProtocol);
-                          const baseUrl = editUsesVertexServiceAccount
-                            ? (nextBaseUrl || defaultVertexBaseUrl(resolvedProtocol))
-                            : nextBaseUrl;
-                          setEditError(null);
-                          const channelFields = { channel: value, fast_mode: speedModeForChannel(value, editForm.fast_mode) };
-                          const nextSharedChannel = presetSharedKeyChannel(editingPreset, value);
-                          if (nextSharedChannel && nextAuthMode === "apikey" && !editUsesVertexServiceAccount) {
-                            const seeded = seedSharedKeyEndpoints(
-                              sharedKeyProtocolEntries(nextSharedChannel),
-                              editForm.api_key ?? "",
-                              endpointOption(resolvedProtocol).id,
-                            );
-                            setEditForm({
-                              ...editForm,
-                              ...channelFields,
-                              auth_mode: nextAuthMode,
-                              protocol_mode: "adaptive",
-                              protocol: seeded.defaultProtocol,
-                              protocol_endpoints: seeded.endpoints,
-                              base_url: seeded.endpoints.find((endpoint) => endpoint.protocol === seeded.defaultProtocol)?.base_url ?? baseUrl,
-                              models_source: config.modelsSource,
-                              static_models: config.staticModels,
-                            });
-                            return;
-                          }
-                          if (
-                            editForm.protocol_mode === "adaptive"
-                            && nextAuthMode === "apikey"
-                            && !editUsesVertexServiceAccount
-                            && presetSharedKeyChannel(editingPreset, editForm.channel) === null
-                          ) {
-                            setEditForm({
-                              ...editForm,
-                              ...channelFields,
-                              auth_mode: nextAuthMode,
-                              models_source: config.modelsSource,
-                              static_models: config.staticModels,
-                            });
-                            return;
-                          }
-                          setEditForm({
-                            ...editForm,
-                            ...channelFields,
-                            protocol: resolvedProtocol,
-                            protocol_mode: "fixed",
-                            protocol_endpoints: [],
-                            auth_mode: nextAuthMode,
-                            base_url: baseUrl,
-                            models_source: config.modelsSource,
-                            static_models: config.staticModels,
-                          });
-                        }}
+                        onValueChange={(value) => changeEditChannel(value)}
                         className="provider-channel-group"
                       >
                         {editingChannelOptions.map((channel) => (
@@ -3029,6 +3244,11 @@ export default function ProvidersPage() {
                         ))}
                       </ToggleGroup>
                     </div>
+                    {editingChannelNotes && (
+                      <p className="col-span-2 -mt-2 text-xs leading-relaxed text-slate-500">
+                        {isZh ? editingChannelNotes.zh : editingChannelNotes.en}
+                      </p>
+                    )}
                     {isDevinProvider(editForm) && <>
                       <DevinLoginNotice isZh={isZh} />
                     </>}
@@ -3718,11 +3938,25 @@ export default function ProvidersPage() {
                         })}
                       />
                     ) : null}
-                    {editingResolvedAuthMode !== "oauth" && editingIsNyroGateway ? (
-                      <NyroGatewayAddressField
+                    {editingResolvedAuthMode !== "oauth" && editingRelay ? (
+                      <RelayAddressField
+                        presetId={editingPreset?.id}
                         value={editForm.base_url ?? ""}
                         isZh={isZh}
-                        onChange={(address) => setEditForm(applyNyroGatewayAddress(editForm, address))}
+                        onChange={(address) => setEditForm(applyRelayAddress(editForm, address, editingRelay))}
+                      />
+                    ) : null}
+                    {editingResolvedAuthMode !== "oauth" && editingRelay && isSub2ApiPreset(editingPreset?.id) ? (
+                      <Sub2ApiPlatformDetect
+                        address={editForm.base_url ?? ""}
+                        apiKey={editForm.api_key ?? ""}
+                        useProxy={Boolean(editForm.use_proxy)}
+                        channel={editingChannelValue}
+                        channels={editingChannelOptions}
+                        detection={editSub2ApiDetection}
+                        onDetected={setEditSub2ApiDetection}
+                        onApply={(platform) => changeEditChannel(platform)}
+                        isZh={isZh}
                       />
                     ) : null}
                     {editingResolvedAuthMode !== "oauth" && editingIsSharedKey ? (
@@ -3731,6 +3965,7 @@ export default function ProvidersPage() {
                         endpoints={editForm.protocol_endpoints ?? []}
                         defaultProtocol={editForm.protocol ?? ""}
                         isZh={isZh}
+                        relay={editingRelay}
                         onChange={(protocolEndpoints, defaultProtocol) => {
                           const defaultEndpoint = protocolEndpoints.find(
                             (endpoint) => endpoint.protocol === defaultProtocol,
@@ -3924,7 +4159,7 @@ export default function ProvidersPage() {
                         </div>
                       </div>
                     )}
-                    <ProviderSpeedMode channel={editForm.channel} value={editForm.fast_mode} isZh={isZh}
+                    <ProviderSpeedMode channel={editForm.channel} presetId={editingPreset?.id} value={editForm.fast_mode} isZh={isZh}
                       onChange={(mode) => setEditForm({ ...editForm, fast_mode: mode })} className="space-y-2" />
                   </div>
                   <div className="flex gap-3">
@@ -3990,26 +4225,49 @@ export default function ProvidersPage() {
                               }))
                             : [],
                           use_proxy: Boolean(editForm.use_proxy),
-                          fast_mode: speedModeForChannel(editForm.channel, editForm.fast_mode),
+                          fast_mode: speedModeForChannel(editForm.channel, editForm.fast_mode, editingPreset?.id),
                           preset_key: editForm.preset_key || undefined,
                           channel: editForm.channel || undefined,
                           models_source: editForm.models_source ?? "",
                           static_models: nativeProviderProtocol(editForm) ? (editForm.static_models ?? "") : editForm.static_models || undefined,
                           api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : (editForm.api_key || undefined),
                         };
-                        updateMut.mutate({ id: editForm.id, ...input });
-                        // Persist usage-query IAM credentials alongside the
-                        // provider (fire-and-forget; blank clears).
-                        void backend("set_provider_usage_credentials", {
-                          id: editForm.id,
-                          access_key: editUsageAk,
-                          secret_key: editUsageSk,
-                        }).catch(() => {
-                          // Non-fatal: usage query simply stays unconfigured.
-                        });
+                        const save = () => {
+                          updateMut.mutate({ id: editForm.id, ...input });
+                          // Persist usage-query IAM credentials alongside the
+                          // provider (fire-and-forget; blank clears).
+                          void backend("set_provider_usage_credentials", {
+                            id: editForm.id,
+                            access_key: editUsageAk,
+                            secret_key: editUsageSk,
+                          }).catch(() => {
+                            // Non-fatal: usage query simply stays unconfigured.
+                          });
+                        };
+                        // Re-check the platform only when what decides it changed.
+                        const sub2apiChanged = isSub2ApiPreset(editingPreset?.id)
+                          && (editSub2ApiDetection?.key === detectionKey(editForm.base_url, editForm.api_key)
+                            || editForm.channel !== p.channel
+                            || (editForm.base_url ?? "").trim() !== p.base_url.trim()
+                            || (editForm.api_key ?? "").trim() !== (p.api_key ?? "").trim());
+                        if (sub2apiChanged) {
+                          void confirmSub2ApiPlatform({
+                            address: editForm.base_url ?? "",
+                            apiKey: editForm.api_key ?? "",
+                            useProxy: Boolean(editForm.use_proxy),
+                            channel: editingChannelValue,
+                            channels: editingChannelOptions,
+                            cached: editSub2ApiDetection,
+                            remember: setEditSub2ApiDetection,
+                            proceed: save,
+                          });
+                          return;
+                        }
+                        save();
                       }}
                       disabled={
                         updateMut.isPending
+                        || sub2apiChecking
                         || editRequiresNewOAuthProvider
                         || reconnectOAuthMut.isPending
                         || logoutOAuthMut.isPending
@@ -4017,7 +4275,9 @@ export default function ProvidersPage() {
                           && !(editForm.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
                       }
                     >
-                      {updateMut.isPending ? (isZh ? "保存中..." : "Saving...") : (isZh ? "保存" : "Save")}
+                      {sub2apiChecking
+                        ? (isZh ? "检查平台中..." : "Checking platform...")
+                        : updateMut.isPending ? (isZh ? "保存中..." : "Saving...") : (isZh ? "保存" : "Save")}
                     </Button>
                     <Button
                       onClick={() => { closeEditForm(); setEditError(null); }}
@@ -4376,6 +4636,26 @@ export default function ProvidersPage() {
         hideCancel
         confirmText={isZh ? "我知道了" : "OK"}
         onConfirm={() => setErrorDialog(null)}
+      />
+      <ConfirmDialog
+        open={Boolean(sub2apiMismatch)}
+        onOpenChange={(open) => {
+          if (!open) setSub2ApiMismatch(null);
+        }}
+        title={isZh ? "Sub2API 平台可能选错了" : "The Sub2API platform may be wrong"}
+        description={sub2apiMismatch
+          ? (isZh
+            ? `根据该 Key 的模型列表和分组信息，识别结果是「${sub2apiMismatch.detected}」（置信度${sub2apiMismatch.confidence === "high" ? "高" : "中"}），当前选择的是「${sub2apiMismatch.selected}」。平台选错会导致请求路由错误或被 Sub2API 拒绝。仍要保存吗？`
+            : `The key's model list and group point to "${sub2apiMismatch.detected}" (${sub2apiMismatch.confidence} confidence), but "${sub2apiMismatch.selected}" is selected. A wrong platform routes requests incorrectly or gets them rejected by Sub2API. Save anyway?`)
+          : undefined}
+        cancelText={isZh ? "返回修改" : "Go back"}
+        confirmText={isZh ? "仍然保存" : "Save anyway"}
+        confirmClassName="bg-amber-600 text-white hover:bg-amber-500"
+        onConfirm={() => {
+          const pending = sub2apiMismatch;
+          setSub2ApiMismatch(null);
+          pending?.proceed();
+        }}
       />
     </div>
   );

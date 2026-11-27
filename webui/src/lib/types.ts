@@ -778,6 +778,32 @@ export interface ProviderKeyProbeStatus {
   tested_at: string;
 }
 
+/** Advisory Sub2API group-platform suggestion. Mirrors `provider::sub2api::detect::Sub2ApiPlatformDetection`. */
+export interface Sub2ApiPlatformDetection {
+  /** Suggested platform id (a Sub2API channel), or null when ambiguous. */
+  platform: string | null;
+  confidence: "low" | "medium" | "high";
+  /** Platforms that fit the evidence when ambiguous. */
+  candidates: string[];
+  group_name?: string | null;
+  model_count: number;
+  sample_models: string[];
+  /** `/v1beta/models` accepted (true), rejected (false) or unknown (null). */
+  gemini_route?: boolean | null;
+  /** English, human-readable reasons. */
+  evidence: string[];
+}
+
+/** Relay-root addressing: one user-supplied origin serves every protocol endpoint. Mirrors `RelayAddressing`. */
+export interface ProviderRelayAddressing {
+  /** Path appended to the root for model discovery (e.g. `/v1/models`). */
+  modelsPath: string;
+  /** Extra route prefix per protocol (e.g. Sub2API Antigravity: `{ "anthropic-messages": "/antigravity" }`). */
+  routePrefixes?: Record<string, string>;
+  /** Trailing segments a pasted address may carry; one is stripped to get the root. */
+  rootSuffixes: string[];
+}
+
 export interface ProviderChannelPreset {
   id: string;
   label: {
@@ -794,6 +820,19 @@ export interface ProviderChannelPreset {
   sharedKeyProtocols?: boolean;
   /** Per-protocol auth-scheme overrides (e.g. `{ "anthropic-messages": "bearer" }`); absent protocol = "auto". */
   authSchemes?: Record<string, string>;
+  /** Channel-level default protocol; absent = the preset's `defaultProtocol`. */
+  defaultProtocol?: string;
+  /** Relay-root addressing (Nyro chain, Sub2API): the form collects one address for every protocol. */
+  relay?: ProviderRelayAddressing;
+  /** Protocols in `baseUrls` that the shared-key picker offers unchecked. */
+  optionalProtocols?: string[];
+  /** Hidden when creating providers; existing providers keep rendering it. */
+  deprecated?: boolean;
+  /** Bilingual caveat shown under the channel selector. */
+  notes?: {
+    zh: string;
+    en: string;
+  };
 }
 
 /** Per-model result of the model probe (default message "hi") over a provider's model list. */
@@ -1212,6 +1251,8 @@ export interface ProviderUsage {
   api_price?: ProviderApiPriceStats | null;
   /** Anonymous, display-only upstream account-pool totals; never routing input or account identities. */
   pool_quota?: NyroUpstreamPoolQuota | null;
+  /** Monetary limits visible in the local Sub2API admin card. */
+  sub2api_quota?: { amounts: Record<string, { used_usd: number; limit_usd: number }>; expires_at?: string } | null;
   /** The remote explicitly marked this forwarded observation stale. */
   stale?: boolean;
   /** Nyro preset (`nyro_gateway`): the remote Nyro's forwarded usage report. */

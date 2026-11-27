@@ -250,6 +250,7 @@ impl AdminService {
                         provider: provider.clone(),
                         credential: Some(credential.clone()),
                     }),
+                    false,
                 )
                 .await;
                 // The legacy HTTP probe can return upstream body previews. The

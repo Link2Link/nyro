@@ -226,6 +226,7 @@ impl VendorRegistry {
         const LEGACY_ORDER: &[&str] = &[
             "custom",
             "nyro-gateway",
+            "sub2api",
             "openai",
             "anthropic",
             "ark-coding",
