@@ -5,7 +5,7 @@
 //
 // Kept free of React so the rules are unit tested directly.
 
-import type { ProviderChannelPreset, ProviderKey, ProviderProtocolEndpoint, Sub2ApiPlatformDetection } from "./types";
+import type { ProviderChannelPreset, Sub2ApiPlatformDetection } from "./types";
 
 export const SUB2API_PRESET_ID = "sub2api";
 
@@ -34,23 +34,6 @@ export function relaysSub2Api(provider: RelayIdentity): boolean {
   const nyro = [provider.vendor, provider.preset_key]
     .some((value) => value?.trim().toLowerCase() === "nyro-gateway");
   return isSub2ApiProvider(provider) || (!nyro && isLegacySub2ApiChannel(provider.channel));
-}
-
-type KeyIdentity = RelayIdentity & {
-  api_key?: string | null;
-  keys?: Pick<ProviderKey, "id">[] | null;
-  protocol_endpoints?: Pick<ProviderProtocolEndpoint, "api_key" | "is_enabled">[] | null;
-};
-
-/**
- * One key speaks for the whole relay, so its quota is read from Sub2API's
- * `/v1/usage`: a usable provider key and no key pool. Mirrors nyro-core
- * `admin::usage::sub2api_upstream_usage`.
- */
-export function sub2apiUpstreamUsage(provider: KeyIdentity): boolean {
-  if (!relaysSub2Api(provider) || (provider.keys?.length ?? 0) > 0) return false;
-  if (provider.api_key?.trim()) return true;
-  return (provider.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled && Boolean(endpoint.api_key?.trim()));
 }
 
 /** Address + key a detection result belongs to; a changed form invalidates it. */

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { speedModeForChannel, supportsSpeedMode } from "./provider-speed-mode";
 import {
   detectionKey, evidenceText, isLegacySub2ApiChannel, isSub2ApiPreset, isSub2ApiProvider, platformLabel,
-  platformMismatch, relaysSub2Api, sub2apiHintText, sub2apiUpstreamUsage,
+  platformMismatch, relaysSub2Api, sub2apiHintText,
 } from "./sub2api";
 import type { Sub2ApiPlatformDetection } from "./types";
 
@@ -31,18 +31,12 @@ test("the speed tier covers Codex consumer channels only", () => {
   equal(speedModeForChannel("openai", "fast"), "normal");
 });
 
-test("one usable key reads Sub2API quota upstream; pools and keyless rows stay local", () => {
+test("relaysSub2Api matches the preset and legacy channel only", () => {
   const relay = { vendor: "sub2api", preset_key: "sub2api", channel: "antigravity" };
   equal(relaysSub2Api(relay), true);
   equal(relaysSub2Api({ vendor: "openai", preset_key: "openai", channel: "sub2api" }), true);
   equal(relaysSub2Api({ vendor: "nyro-gateway", preset_key: "nyro-gateway", channel: "sub2api" }), false);
   equal(relaysSub2Api({ vendor: "google", preset_key: "google", channel: "antigravity" }), false);
-  equal(sub2apiUpstreamUsage({ ...relay, api_key: "sk" }), true);
-  equal(sub2apiUpstreamUsage({ ...relay, api_key: " " }), false);
-  equal(sub2apiUpstreamUsage({ ...relay, api_key: "", protocol_endpoints: [{ api_key: "sk", is_enabled: true }] }), true);
-  equal(sub2apiUpstreamUsage({ ...relay, api_key: "", protocol_endpoints: [{ api_key: "sk", is_enabled: false }] }), false);
-  equal(sub2apiUpstreamUsage({ ...relay, api_key: "sk", keys: [{ id: "k1" }] }), false);
-  equal(sub2apiUpstreamUsage({ vendor: "openai", preset_key: "openai", channel: "default", api_key: "sk" }), false);
 });
 
 function detection(platform: string | null, confidence: Sub2ApiPlatformDetection["confidence"]): Sub2ApiPlatformDetection {

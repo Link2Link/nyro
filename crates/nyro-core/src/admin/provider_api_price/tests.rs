@@ -856,7 +856,6 @@ fn snapshot(provider: &str, kind: &str, now: i64, tiers: Vec<ProviderUsageTier>)
         quota_buckets: vec![],
         account_pool: None,
         pool_quota: None,
-        sub2api_quota: None,
         upstream: None,
     }
 }

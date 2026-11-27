@@ -1251,8 +1251,6 @@ export interface ProviderUsage {
   api_price?: ProviderApiPriceStats | null;
   /** Anonymous, display-only upstream account-pool totals; never routing input or account identities. */
   pool_quota?: NyroUpstreamPoolQuota | null;
-  /** Monetary limits visible in the local Sub2API admin card. */
-  sub2api_quota?: { amounts: Record<string, { used_usd: number; limit_usd: number }>; expires_at?: string } | null;
   /** The remote explicitly marked this forwarded observation stale. */
   stale?: boolean;
   /** Nyro preset (`nyro_gateway`): the remote Nyro's forwarded usage report. */

@@ -239,7 +239,6 @@ pub(crate) fn bucket_usage(usage: &ProviderUsage, bucket: &QuotaBucket) -> Provi
         api_price: bucket.api_price.clone(),
         account_pool: None,
         pool_quota: None,
-        sub2api_quota: None,
         upstream: None,
         quota_buckets: Vec::new(),
     }
@@ -521,7 +520,6 @@ mod tests {
                 api_price: None,
                 account_pool: None,
                 pool_quota: None,
-                sub2api_quota: None,
                 upstream: None,
                 quota_buckets: vec![bucket("flash", "Flash"), bucket("argon", "Argon")],
             }),

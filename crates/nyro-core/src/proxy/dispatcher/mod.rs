@@ -2547,10 +2547,6 @@ async fn dispatch_pipeline_inner(
                             ctx,
                         )));
             let status = response.status().as_u16();
-            let sub2api_rejection = response
-                .extensions()
-                .get::<crate::provider::sub2api::errors::Sub2ApiRejection>()
-                .copied();
             if pool_account.is_none()
                 && crate::provider::google::is_subscription_channel(&provider)
                 && let Some(violation) = response
@@ -2606,17 +2602,6 @@ async fn dispatch_pipeline_inner(
                         &quota_owner_fence,
                     );
                 }
-                crate::admin::trigger_provider_usage_refresh(
-                    gw.clone(),
-                    target.provider_id.clone(),
-                );
-            }
-            // Sub2API billing refusals (balance, subscription, key quota) are
-            // usually 403s: re-read the key's quota so an exhausted key is
-            // paused until it recovers. 429s were refreshed just above.
-            if status != 429
-                && sub2api_rejection.is_some_and(|rejection| rejection.refreshes_usage())
-            {
                 crate::admin::trigger_provider_usage_refresh(
                     gw.clone(),
                     target.provider_id.clone(),

@@ -18,7 +18,6 @@ pub mod detect;
 pub mod errors;
 pub mod platform;
 pub mod url;
-pub mod usage;
 
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;

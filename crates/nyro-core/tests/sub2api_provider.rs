@@ -51,8 +51,6 @@ struct Mock {
     hits: Arc<Mutex<Vec<Hit>>>,
     /// Paths answered with 400 like a group whose platform rejects the route.
     reject: Arc<Mutex<Vec<String>>>,
-    /// `GET /v1/usage` answer; `None` answers 404 like an older Sub2API.
-    usage: Arc<Mutex<Option<Value>>>,
     /// `GET /v1/sub2api/billing` group name.
     group_name: Arc<Mutex<Option<String>>>,
     /// `GET /v1/models` override.
@@ -146,12 +144,6 @@ async fn mock_handler(
             .into_response();
     }
     let model = body["model"].as_str().unwrap_or("gemini").to_string();
-    if method == Method::GET && path == "/v1/usage" {
-        return match mock.usage.lock().unwrap().clone() {
-            Some(report) => Json(report).into_response(),
-            None => (StatusCode::NOT_FOUND, "404 page not found").into_response(),
-        };
-    }
     if method == Method::GET && path == "/v1/sub2api/billing" {
         let group = mock.group_name.lock().unwrap().clone();
         return Json(json!({"object":"sub2api.key_billing","schema_version":1,"group_name":group}))
@@ -770,26 +762,11 @@ async fn attempt_causes(gw: &Gateway, provider: &str) -> String {
     panic!("no attempt log for provider {provider}");
 }
 
-fn quota_limited_report(five_hour_used: f64, reset_at: &str) -> Value {
-    json!({
-        "mode": "quota_limited", "isValid": true, "status": "active",
-        "quota": {"limit": 40.0, "used": 10.0, "remaining": 30.0, "unit": "USD"},
-        "rate_limits": [
-            {"window": "5h", "limit": 5.0, "used": five_hour_used, "remaining": 0.0,
-             "window_start": "2026-11-27T00:00:00Z", "reset_at": reset_at}
-        ],
-        "usage": {"today": {"actual_cost": 1.25}, "total": {"actual_cost": 10.0}}
-    })
-}
-
 #[tokio::test]
-async fn usage_reads_the_key_quota_and_pauses_until_the_window_resets() {
+async fn usage_uses_local_accounting_without_polling_upstream() {
     use nyro_core::admin::ProviderSchedulingStatus;
     let dir = tempfile::tempdir().unwrap();
     let (mock, mock_url) = mock_sub2api().await;
-    let reset = (chrono::Utc::now() + chrono::Duration::hours(2))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    *mock.usage.lock().unwrap() = Some(quota_limited_report(5.0, &reset));
     let gw = gateway(&dir).await;
     let provider = sub2api_provider(
         &gw,
@@ -800,116 +777,29 @@ async fn usage_reads_the_key_quota_and_pauses_until_the_window_resets() {
     )
     .await
     .unwrap();
-
-    let usage = gw.admin().get_provider_usage(&provider).await.unwrap();
-    assert_eq!(usage.kind, "sub2api_key");
-    let tiers: Vec<(&str, f64, Option<&str>)> = usage
-        .tiers
-        .iter()
-        .map(|tier| {
-            (
-                tier.name.as_str(),
-                tier.used_percent,
-                tier.resets_at.as_deref(),
-            )
-        })
-        .collect();
-    let instant = |value: Option<&str>| {
-        value.map(|text| {
-            chrono::DateTime::parse_from_rfc3339(text)
-                .unwrap()
-                .timestamp()
-        })
-    };
-    assert_eq!(
-        tiers
-            .iter()
-            .map(|(name, used, reset)| (*name, *used, instant(*reset)))
-            .collect::<Vec<_>>(),
-        [
-            ("five_hour", 100.0, instant(Some(&reset))),
-            ("key_quota", 25.0, None)
-        ]
-    );
-    let spends: Vec<(&str, f64)> = usage
-        .spends
-        .iter()
-        .map(|spend| (spend.name.as_str(), spend.amount))
-        .collect();
-    assert_eq!(spends, [("today", 1.25), ("total", 10.0)]);
-    assert_eq!(usage.is_available, Some(true));
-    assert!(
-        usage.api_price.is_some(),
-        "local API price stays on the card"
-    );
-    assert_eq!(
-        usage.scheduling.status,
-        ProviderSchedulingStatus::QuotaExhausted
-    );
-    assert_eq!(
-        instant(usage.scheduling.reset_at.as_deref()),
-        instant(Some(&reset))
-    );
-    assert_eq!(usage.scheduling.blocking_tiers, ["five_hour"]);
-    let amount = &usage.sub2api_quota.as_ref().unwrap().amounts["key_quota"];
-    assert_eq!((amount.used_usd, amount.limit_usd), (10., 40.));
-
-    *mock.usage.lock().unwrap() = Some(quota_limited_report(0.0, &reset));
-    assert_eq!(
-        gw.admin()
-            .get_provider_usage(&provider)
-            .await
-            .unwrap()
-            .scheduling
-            .status,
-        ProviderSchedulingStatus::Eligible
-    );
-
-    *mock.usage.lock().unwrap() = Some(quota_limited_report(5.0, &reset));
-    gw.admin().get_provider_usage(&provider).await.unwrap();
-    mock.reject.lock().unwrap().push("/v1/usage".into());
-    assert!(gw.admin().get_provider_usage(&provider).await.is_err());
-    assert!(gw.quota_registry.is_schedulable(&provider));
-
-    // The poll asks Sub2API for one day of statistics only.
-    let query = mock
-        .hits
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|hit| hit.path == "/v1/usage")
-        .map(|hit| hit.query.clone())
-        .unwrap();
-    assert!(query.starts_with("days=1&start_date="), "{query}");
-}
-
-#[tokio::test]
-async fn usage_without_the_endpoint_falls_back_to_local_accounting() {
-    use nyro_core::admin::ProviderSchedulingStatus;
-    let dir = tempfile::tempdir().unwrap();
-    let (_mock, mock_url) = mock_sub2api().await;
-    let gw = gateway(&dir).await;
-    let provider = sub2api_provider(&gw, "kimi", &mock_url, &[CHAT], OpenAiSpeedMode::Normal)
-        .await
-        .unwrap();
     let usage = gw.admin().get_provider_usage(&provider).await.unwrap();
     assert_eq!(usage.kind, "sub2api");
     assert_eq!(usage.site, "local");
     assert!(usage.tiers.is_empty());
+    assert!(usage.balances.is_empty());
+    assert!(usage.spends.is_empty());
+    assert_eq!(usage.is_available, None);
     assert!(usage.api_price.is_some());
     assert_eq!(usage.scheduling.status, ProviderSchedulingStatus::Eligible);
+    assert!(gw.quota_registry.is_schedulable(&provider));
+    assert!(
+        !mock.gets().iter().any(|path| path == "/v1/usage"),
+        "Sub2API usage must not poll upstream /v1/usage: {:?}",
+        mock.gets()
+    );
 }
 
 #[tokio::test]
-async fn billing_rejection_fails_over_records_a_hint_and_pauses_the_key() {
+async fn billing_rejection_fails_over_records_a_hint_without_pausing_via_upstream_usage() {
     use nyro_core::admin::ProviderSchedulingStatus;
     let dir = tempfile::tempdir().unwrap();
     let (relay, relay_url) = mock_sub2api().await;
     let (backup, backup_url) = mock_sub2api().await;
-    *relay.usage.lock().unwrap() = Some(json!({
-        "mode": "unrestricted", "isValid": true, "planName": "钱包余额",
-        "remaining": 5.0, "balance": 5.0, "unit": "USD"
-    }));
     let gw = logged_gateway(&dir).await;
     let primary = sub2api_provider(&gw, "kimi", &relay_url, &[CHAT], OpenAiSpeedMode::Normal)
         .await
@@ -917,15 +807,10 @@ async fn billing_rejection_fails_over_records_a_hint_and_pauses_the_key() {
     let secondary = custom_chat_provider(&gw, "backup", &backup_url).await;
     failover_route(&gw, "kimi", &primary, &secondary, "kimi-k3").await;
 
-    // The wallet runs dry: inference is refused and usage reports $0.
     *relay.fail_posts.lock().unwrap() = Some((
         403,
         json!({"type":"error","error":{"type":"billing_error","message":"insufficient balance"}}),
     ));
-    *relay.usage.lock().unwrap() = Some(json!({
-        "mode": "unrestricted", "isValid": true, "planName": "钱包余额",
-        "remaining": 0.0, "balance": 0.0, "unit": "USD"
-    }));
     let nyro = serve(create_router(gw.clone())).await;
     let (status, body) = post(
         format!("{nyro}/v1/chat/completions"),
@@ -942,17 +827,15 @@ async fn billing_rejection_fails_over_records_a_hint_and_pauses_the_key() {
         causes.contains("Sub2API rejected the key for billing"),
         "{causes}"
     );
-
-    // The rejection refreshed usage, which pauses the exhausted key.
-    let mut paused = false;
-    for _ in 0..100 {
-        if gw.quota_registry.snapshot(&primary).status == ProviderSchedulingStatus::QuotaExhausted {
-            paused = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(paused, "an empty wallet must pause the provider");
+    assert_eq!(
+        gw.quota_registry.snapshot(&primary).status,
+        ProviderSchedulingStatus::Eligible
+    );
+    assert!(
+        !relay.gets().iter().any(|path| path == "/v1/usage"),
+        "billing rejection must not trigger upstream /v1/usage polling: {:?}",
+        relay.gets()
+    );
 }
 
 #[tokio::test]

@@ -1380,7 +1380,6 @@ impl AdminService {
             api_price: None,
             account_pool: Some(view),
             pool_quota: None,
-            sub2api_quota: None,
             upstream: None,
         }
     }

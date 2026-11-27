@@ -30,19 +30,14 @@ test("Sub2API preset providers use local accounting by identity on any host", ()
   }
 });
 
-test("Sub2API providers with one usable key read the upstream quota card", () => {
+test("Sub2API providers always stay on local accounting regardless of host or channel", () => {
   const relay = { vendor: "sub2api", preset_key: "sub2api", channel: "openai", auth_mode: "apikey" as const,
-    base_url: "https://api.xyz.ai", api_key: "sk-relay" };
-  equal(localUsageKind(relay), null);
-  equal(providerUsageSupported(relay), true);
-  equal(localUsageKind({ ...relay, keys: [{ id: "k1" } as never] }), "sub2api");
-  equal(providerUsageSupported({ ...relay, keys: [{ id: "k1" } as never] }), false);
+    base_url: "https://api.xyz.ai" };
+  equal(localUsageKind(relay), "sub2api");
+  equal(providerUsageSupported(relay), false);
   const legacy = { ...relay, vendor: "openai", preset_key: "openai", channel: "sub2api" };
-  equal(providerUsageSupported(legacy), true);
-  equal(providerUsageTitle("sub2api_key", false), "Sub2API Quota");
-  equal(providerUsageTitle("sub2api_key", true), "Sub2API 额度");
-  equal(tierLabel("key_quota", true), "Key 总额度");
-  equal(tierLabel("key_quota", false), "Key quota");
+  equal(localUsageKind(legacy), "sub2api");
+  equal(providerUsageSupported(legacy), false);
 });
 
 test("Anthropic default channel uses local accounting unless a vendor quota URL applies", () => {

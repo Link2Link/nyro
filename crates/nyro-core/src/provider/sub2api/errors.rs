@@ -36,11 +36,6 @@ pub struct Sub2ApiRejection {
 }
 
 impl Sub2ApiRejection {
-    /// Billing rejections change the key's quota state: re-read `/v1/usage`.
-    pub fn refreshes_usage(self) -> bool {
-        self.kind == RejectionKind::Billing
-    }
-
     /// Operator-facing explanation, recorded on the request log and appended
     /// to admin probe/connection-test errors.
     pub fn hint(self) -> &'static str {
@@ -374,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn only_billing_refreshes_usage_and_every_kind_has_a_hint() {
+    fn every_rejection_kind_has_a_hint() {
         use RejectionKind::*;
         for kind in [
             Billing,
@@ -384,7 +379,6 @@ mod tests {
             ModelNotInGroup,
         ] {
             let rejection = Sub2ApiRejection { kind };
-            assert_eq!(rejection.refreshes_usage(), kind == Billing);
             assert!(
                 rejection.hint().starts_with("This")
                     || rejection.hint().starts_with("Sub2API")

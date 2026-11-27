@@ -1,6 +1,6 @@
 # Sub2API 供应商：按分组平台完整对接（设计）
 
-> 状态：**P1 已实现**（§8）；P2 已实现上游额度、拒绝处理与平台识别（§9）；其余 P2 项与 P3 尚未实现。基线：nyro v2.1.57（`6674406`）；sub2api `81ce8356d`（本机 `~/code/sub2api`）。
+> 状态：**P1 已实现**（§8）；P2 已实现拒绝处理与平台识别（§9；已移除上游 `/v1/usage` 余额/额度轮询与调度暂停，Sub2API 始终仅保留本地计费统计）；其余 P2 项与 P3 尚未实现。基线：nyro v2.1.57（`6674406`）；sub2api `81ce8356d`（本机 `~/code/sub2api`）。
 > English: [sub2api-provider.md](sub2api-provider.md)
 
 ## 1. 背景、目标与非目标
@@ -392,14 +392,12 @@ P1 之后的进展见 §9。
 
 | 模块 | 内容 |
 |---|---|
-| 上游额度 | [usage.rs](../../crates/nyro-core/src/provider/sub2api/usage.rs)：`GET {root}/v1/usage?days=1&start_date=…&end_date=…`（只取当天统计，轮询开销小）。`quota_limited`：Key 总额度 → `key_quota`（无重置）、5h/1d/7d → `five_hour`/`daily`/`weekly_limit`（`reset_at` 规范为 UTC 秒）；`unrestricted` 订阅：日/周/月 USD 限额 → `daily`/`weekly_limit`/`monthly`（周重置 = `weekly_window_start + 7d`，日/月不返回起点故无重置时刻），`planName` → level；钱包：`balance` → USD 余额；`usage.today/total.actual_cost` → `spends`。Key 状态 `quota_exhausted`/`expired`/`disabled`、`isValid=false`、余额 ≤0 → 不可用 |
-| 用量后端 | [admin/usage.rs](../../crates/nyro-core/src/admin/usage.rs)：`UsageBackend::Sub2Api`（kind `sub2api_key`），只在一个 Key 代表整个 Provider 时启用（Key 可用且未启用 Key 池）；Key 池、无 Key 仍为本地统计。404/405/501 或非 Sub2API JSON（`UsageUnsupported`）时卡片降级为本地统计、转发报告标 `unsupported`。管理卡片显示各窗口的已用金额和总限额（USD），上游提供时显示到期时间。下方显示本地累计和本月统计 |
-| 调度 | 复用 `ProviderQuotaRegistry`：窗口满额暂停到重置时刻；`key_quota`、无重置时刻的窗口、不可用状态暂停并每 60s 复查；查询失败时解除该 Provider 已有的额度暂停，按退避周期复查 |
+| 用量与调度 | [admin/usage.rs](../../crates/nyro-core/src/admin/usage.rs)：Sub2API 始终仅保留本地日志统计（`LocalUsageAccounting::Sub2Api`，kind `sub2api`），不轮询上游 `/v1/usage`，也不以上游余额/额度暂停调度（避免私有/SimpleMode 零余额实例被误判不可用） |
 | 拒绝识别 | [errors.rs](../../crates/nyro-core/src/provider/sub2api/errors.rs)：`classify(status, body)` 按 Sub2API 的错误码与原文识别计费拒绝（`billing_error`、`insufficient_quota`、`INSUFFICIENT_BALANCE`、`API_KEY_QUOTA_EXHAUSTED`、`API_KEY_EXPIRED`、订阅/限额/RPM 码，以及 `rate_limit_exceeded` 和 Google 信封下只能靠原文的情形）和四类配置拒绝；上游账号自身的 429/限流不算 |
-| 故障转移 | dispatcher 三条 HTTP 错误出口（非流式、流式、compat）给命中的响应打 `Sub2ApiRejection` + 健康中性；无论状态码（含 403/404）都切到下一个路由目标；计费拒绝触发一次额度刷新（429 沿用已有刷新） |
+| 故障转移 | dispatcher 三条 HTTP 错误出口（非流式、流式、compat）给命中的响应打 `Sub2ApiRejection` + 健康中性；无论状态码（含 403/404）都切到下一个路由目标 |
 | 提示 | 请求日志 `error_causes` 追加英文提示（`LogDiagnostic::add_cause`，不改失败结果/类型/阶段）；模型探测、连接测试的失败信息同样附带提示，中文界面显示相应的处理建议 |
 | 平台识别 | [detect.rs](../../crates/nyro-core/src/provider/sub2api/detect.rs)：并行读取 `/v1/models`、`/v1beta/models`、`/v1/sub2api/billing?include=group`；纯函数 `infer` 给出平台、置信度（高/中/低）、候选和依据；分组名只用于打破平局。管理接口 `POST /api/v1/sub2api/detect-platform`、桌面命令 `detect_sub2api_platform` |
-| WebUI | 「识别平台」按钮与结果面板（[sub2api-platform-detect.tsx](../../webui/src/components/sub2api-platform-detect.tsx)，依据中英文本地化，可一键改用建议平台）；新建，或编辑时平台/地址/Key 变化后保存，会复用或自动运行识别，与中/高置信度结果不一致时弹窗确认，识别失败不阻止保存；用量卡片新增 `sub2api_key` 视图 |
-| 测试 | 单元测试覆盖额度解析、拒绝分类、平台推断与健康中性标记；[sub2api_provider.rs](../../crates/nyro-core/tests/sub2api_provider.rs) 新增额度与暂停、无 `/v1/usage` 降级、计费拒绝故障转移与提示和暂停、404 配置拒绝故障转移、探测提示、平台识别；WebUI 新增额度卡片渲染与识别规则测试 |
+| WebUI | 「识别平台」按钮与结果面板（[sub2api-platform-detect.tsx](../../webui/src/components/sub2api-platform-detect.tsx)，依据中英文本地化，可一键改用建议平台）；新建，或编辑时平台/地址/Key 变化后保存，会复用或自动运行识别，与中/高置信度结果不一致时弹窗确认，识别失败不阻止保存；用量卡片仅保留本地 `sub2api` 视图 |
+| 测试 | 单元测试覆盖拒绝分类、平台推断与健康中性标记；[sub2api_provider.rs](../../crates/nyro-core/tests/sub2api_provider.rs) 覆盖本地统计且不请求上游 `/v1/usage`、计费拒绝故障转移与提示（不暂停调度）、404 配置拒绝故障转移、探测提示、平台识别；WebUI 覆盖本地用量渲染与识别规则测试 |
 
 仍未实现：§3.7 旧渠道「一键迁移」、§3.11 会话粘性、YAML `channel` 字段，以及 P3 各项。
