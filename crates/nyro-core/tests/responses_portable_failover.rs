@@ -92,7 +92,7 @@ async fn start_upstream(reply: Reply) -> anyhow::Result<Upstream> {
     })
 }
 
-async fn read_request(socket: &mut TcpStream) -> anyhow::Result<Value> {
+async fn read_request(socket: &mut TcpStream) -> anyhow::Result<Option<Value>> {
     let mut input = Vec::new();
     let mut buffer = [0_u8; 4096];
     let header_end = loop {
@@ -106,6 +106,16 @@ async fn read_request(socket: &mut TcpStream) -> anyhow::Result<Value> {
     };
     let headers = std::str::from_utf8(&input[..header_end])?;
     let request_line = headers.lines().next().unwrap_or_default();
+    // Legacy Sub2API channels poll their usage alongside inference. Model this
+    // relay as an older deployment without that endpoint. Only POSTs exercise
+    // the inference replay assertions.
+    let mut parts = request_line.split_whitespace();
+    if parts.next() == Some("GET")
+        && parts.next().and_then(|path| path.split('?').next()) == Some("/v1/usage")
+    {
+        write_response(socket, "404 Not Found", "application/json", "{}", false).await?;
+        return Ok(None);
+    }
     anyhow::ensure!(
         request_line.starts_with("POST ") && request_line.contains("/responses "),
         "unexpected route: {request_line}"
@@ -125,9 +135,9 @@ async fn read_request(socket: &mut TcpStream) -> anyhow::Result<Value> {
         anyhow::ensure!(count != 0, "request closed before body");
         input.extend_from_slice(&buffer[..count]);
     }
-    Ok(serde_json::from_slice(
+    Ok(Some(serde_json::from_slice(
         &input[header_end..header_end + length],
-    )?)
+    )?))
 }
 
 async fn serve(
@@ -135,7 +145,9 @@ async fn serve(
     reply: Reply,
     requests: Arc<Mutex<Vec<Value>>>,
 ) -> anyhow::Result<()> {
-    let body = read_request(&mut socket).await?;
+    let Some(body) = read_request(&mut socket).await? else {
+        return Ok(());
+    };
     requests.lock().unwrap().push(body.clone());
     if matches!(reply, Reply::CloseBeforeHeaders) {
         socket.shutdown().await?;

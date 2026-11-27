@@ -12,6 +12,14 @@ pub(super) fn resolve_models_endpoint(provider: &Provider) -> Option<String> {
             return Some(trimmed.to_string());
         }
     }
+    // Sub2API lists the group's models on its gateway root, whatever the
+    // address was pasted with (`…/v1`, `…/antigravity`).
+    if crate::provider::sub2api::is_sub2api(provider) {
+        return crate::provider::sub2api::url::models_url(
+            crate::provider::sub2api::Sub2ApiPlatform::of_preset(provider),
+            &provider.base_url,
+        );
+    }
 
     let base = provider.base_url.trim_end_matches('/');
     match crate::protocol::registry::ProtocolRegistry::global().parse_protocol(&provider.protocol) {
@@ -110,6 +118,17 @@ pub(super) fn build_model_headers(
     let is_google_vendor = vendor
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("google"));
+    // Sub2API: every listing route takes Bearer (`/v1` rejects `?key=`).
+    if vendor
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case(crate::provider::sub2api::VENDOR_ID))
+    {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+        );
+        return Ok(headers);
+    }
     match crate::protocol::registry::ProtocolRegistry::global().parse_protocol(protocol) {
         Some(crate::protocol::ids::Protocol::AnthropicMessages) => {
             headers.insert("x-api-key", HeaderValue::from_str(api_key)?);

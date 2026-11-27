@@ -78,6 +78,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             protocol: "anthropic-messages",
             auth_scheme: "bearer",
         }]),
+        ..ChannelDef::DEFAULT
     }],
 };
 

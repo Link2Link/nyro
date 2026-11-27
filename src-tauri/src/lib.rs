@@ -72,6 +72,7 @@ pub fn run() {
             commands::get_provider_presets,
             commands::get_loaded_extensions,
             commands::create_provider,
+            commands::detect_sub2api_platform,
             commands::copy_provider,
             commands::update_provider,
             commands::delete_provider,

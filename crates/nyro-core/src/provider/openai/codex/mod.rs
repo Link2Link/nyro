@@ -24,9 +24,11 @@ pub(crate) fn sync_speed_routing_hint(
     if protocol != OPENAI_RESPONSES_V1 || !headers.contains_key(HINT) {
         return;
     }
-    let channel = provider.channel.as_deref();
-    let Some(tier) = openai_service_tier_override(provider.fast_mode, channel, protocol.protocol)
-    else {
+    let Some(tier) = openai_service_tier_override(
+        provider.fast_mode,
+        crate::provider::dialect::is_codex_consumer(provider),
+        protocol.protocol,
+    ) else {
         return;
     };
     let hint = format!("model={model};tier={tier}");

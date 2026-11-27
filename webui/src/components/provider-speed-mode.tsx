@@ -4,15 +4,17 @@ import type { OpenAiSpeedMode } from "../lib/types";
 
 interface ProviderSpeedModeProps {
   channel?: string | null;
+  /** Preset of the channel: `sub2api/openai` also carries the speed tier. */
+  presetId?: string | null;
   value?: OpenAiSpeedMode;
   onChange: (mode: OpenAiSpeedMode) => void;
   isZh: boolean;
   className?: string;
 }
 
-export function ProviderSpeedMode({ channel, value = "normal", onChange, isZh, className }: ProviderSpeedModeProps) {
+export function ProviderSpeedMode({ channel, presetId, value = "normal", onChange, isZh, className }: ProviderSpeedModeProps) {
   const id = useId();
-  if (!supportsSpeedMode(channel)) return null;
+  if (!supportsSpeedMode(channel, presetId)) return null;
   return (
     <div className={className}>
       <label htmlFor={id} className="text-sm font-medium text-slate-800">{isZh ? "速度模式" : "Speed mode"}</label>

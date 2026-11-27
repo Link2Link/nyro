@@ -57,6 +57,48 @@ pub struct ProtocolAuthScheme {
     pub auth_scheme: &'static str,
 }
 
+/// Extra path prefix a relay inserts for one protocol (e.g. Sub2API routes
+/// Antigravity Messages under `/antigravity`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ProtocolRoutePrefix {
+    pub protocol: &'static str,
+    pub prefix: &'static str,
+}
+
+/// Relay-root addressing: one user-supplied origin serves every protocol
+/// endpoint of the channel (Nyro, Sub2API). The WebUI renders a single
+/// address field, stores the normalized root on every endpoint and derives
+/// `models_source = root + models_path`; the vendor's `build_url` inserts
+/// the per-protocol prefix in front of the encoder path.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayAddressing {
+    /// Path appended to the root for model discovery (e.g. `/v1/models`).
+    pub models_path: &'static str,
+    /// Per-protocol prefix between the root and the encoder path
+    /// (serialized as `{protocol: prefix}`).
+    #[serde(
+        serialize_with = "serialize_route_prefixes",
+        skip_serializing_if = "<[ProtocolRoutePrefix]>::is_empty"
+    )]
+    pub route_prefixes: &'static [ProtocolRoutePrefix],
+    /// Trailing segments a pasted address may carry; one of them (first
+    /// match, case-insensitive) is stripped to obtain the root.
+    pub root_suffixes: &'static [&'static str],
+}
+
+impl RelayAddressing {
+    /// Prefix inserted for `protocol` (a protocol suite id such as
+    /// `anthropic-messages`); empty when the protocol uses the root.
+    pub fn route_prefix(&self, protocol: &str) -> &'static str {
+        self.route_prefixes
+            .iter()
+            .find(|entry| entry.protocol.eq_ignore_ascii_case(protocol))
+            .map(|entry| entry.prefix)
+            .unwrap_or("")
+    }
+}
+
 /// OAuth configuration for a channel.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +159,51 @@ pub struct ChannelDef {
         skip_serializing_if = "Option::is_none"
     )]
     pub auth_schemes: Option<&'static [ProtocolAuthScheme]>,
+    /// Channel-level default protocol (protocol suite id). `None` keeps the
+    /// vendor-level `default_protocol`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_protocol: Option<&'static str>,
+    /// Relay-root addressing (see [`RelayAddressing`]); `None` for vendors
+    /// with fixed per-protocol base URLs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayAddressing>,
+    /// Protocols declared in `base_urls` that the shared-key picker offers
+    /// unchecked: usable, but not part of the recommended default set.
+    #[serde(skip_serializing_if = "<[&str]>::is_empty")]
+    pub optional_protocols: &'static [&'static str],
+    /// Hidden from the create flow; existing providers keep resolving it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub deprecated: bool,
+    /// Bilingual caveat rendered under the channel selector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Label>,
+}
+
+impl ChannelDef {
+    /// Baseline for struct-update syntax (`..ChannelDef::DEFAULT`) so new
+    /// optional fields do not touch every vendor literal.
+    pub const DEFAULT: ChannelDef = ChannelDef {
+        id: "default",
+        label: Label {
+            zh: "默认",
+            en: "Default",
+        },
+        base_urls: &[],
+        api_key: None,
+        models_source: None,
+        capabilities_source: CapabilitiesSource::Auto,
+        static_models: &[],
+        auth_mode: AuthMode::ApiKey,
+        oauth: None,
+        runtime: None,
+        shared_key_protocols: false,
+        auth_schemes: None,
+        default_protocol: None,
+        relay: None,
+        optional_protocols: &[],
+        deprecated: false,
+        notes: None,
+    };
 }
 
 /// Top-level vendor entry. One `VendorMetadata` per vendor.
@@ -142,6 +229,21 @@ where
     let mut map = serializer.serialize_map(Some(base_urls.len()))?;
     for entry in base_urls.iter() {
         map.serialize_entry(entry.protocol, entry.base_url)?;
+    }
+    map.end()
+}
+
+fn serialize_route_prefixes<S>(
+    prefixes: &&[ProtocolRoutePrefix],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(prefixes.len()))?;
+    for entry in prefixes.iter() {
+        map.serialize_entry(entry.protocol, entry.prefix)?;
     }
     map.end()
 }

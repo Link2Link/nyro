@@ -171,7 +171,10 @@ pub(super) async fn handle_stream(
             .await
             .unwrap_or_else(|_| serde_json::json!({"error": {"message": "upstream error"}}));
         let err_body_str = crate::logging::payload::capture_json(&err_body, true).body;
-        log.status(status)
+        let sub2api =
+            crate::provider::sub2api::errors::rejection(call_ctx.provider, status, &err_body);
+        log.note(sub2api.map(|rejection| rejection.hint()))
+            .status(status)
             .upstream_status(status as i32)
             .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
             .upstream_resp_headers(upstream_hdrs_str.clone())
@@ -185,6 +188,7 @@ pub(super) async fn handle_stream(
             .into_response();
         response.headers_mut().extend(response_metadata);
         super::mark_upstream_error(&mut response, status, &err_body, retry_after);
+        super::mark_sub2api_rejection(&mut response, sub2api);
         return response;
     }
 

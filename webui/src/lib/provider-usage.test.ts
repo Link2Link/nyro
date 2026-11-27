@@ -20,6 +20,31 @@ test("Sub2API local accounting requires the channel and never replaces a Nyro re
   equal(providerUsageTitle("sub2api", true), "Sub2API 用量");
 });
 
+test("Sub2API preset providers use local accounting by identity on any host", () => {
+  for (const base_url of ["https://api.xyz.ai", "https://relay.example.test/api.kimi.com", "https://token-plan.example.com"]) {
+    for (const channel of ["antigravity", "openai", "zhipu"]) {
+      const provider = { vendor: "sub2api", preset_key: "sub2api", channel, auth_mode: "apikey" as const, base_url };
+      equal(localUsageKind(provider), "sub2api", `${channel} @ ${base_url}`);
+      equal(providerUsageSupported(provider), false, `${channel} @ ${base_url}`);
+    }
+  }
+});
+
+test("Sub2API providers with one usable key read the upstream quota card", () => {
+  const relay = { vendor: "sub2api", preset_key: "sub2api", channel: "openai", auth_mode: "apikey" as const,
+    base_url: "https://api.xyz.ai", api_key: "sk-relay" };
+  equal(localUsageKind(relay), null);
+  equal(providerUsageSupported(relay), true);
+  equal(localUsageKind({ ...relay, keys: [{ id: "k1" } as never] }), "sub2api");
+  equal(providerUsageSupported({ ...relay, keys: [{ id: "k1" } as never] }), false);
+  const legacy = { ...relay, vendor: "openai", preset_key: "openai", channel: "sub2api" };
+  equal(providerUsageSupported(legacy), true);
+  equal(providerUsageTitle("sub2api_key", false), "Sub2API Quota");
+  equal(providerUsageTitle("sub2api_key", true), "Sub2API 额度");
+  equal(tierLabel("key_quota", true), "Key 总额度");
+  equal(tierLabel("key_quota", false), "Key quota");
+});
+
 test("Anthropic default channel uses local accounting unless a vendor quota URL applies", () => {
   const anthropic = { vendor: "anthropic", preset_key: "anthropic", channel: "default",
     auth_mode: "apikey" as const, base_url: "https://api.anthropic.com" };

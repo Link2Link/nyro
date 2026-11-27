@@ -3,6 +3,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
+import { relaysSub2Api } from "@/lib/sub2api";
 import { isKiroOverage, isLocalUsageKind, localUsageKind, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { isClaudeCodeOAuthProvider } from "@/lib/claude-account-pool";
@@ -57,7 +58,9 @@ function TierBar({
   tier,
   isZh,
   now,
+  amount,
 }: {
+  amount?: { used_usd: number; limit_usd: number };
   tier: ProviderUsageTier;
   isZh: boolean;
   /** Tracked so the steady-pace marker re-evaluates on the 30s tick. */
@@ -71,6 +74,9 @@ function TierBar({
       <span className="min-w-14 max-w-36 shrink-0 font-medium text-slate-500" title={tier.name}>
         {tierLabel(tier.name, isZh)}
       </span>
+      {amount && <span className="shrink-0 tabular-nums" title={isZh ? "已用 / 总额度（USD）" : "Used / limit (USD)"}>
+        {`$${amount.used_usd.toFixed(2)} / $${amount.limit_usd.toFixed(2)}`}
+      </span>}
       <UsageProgress usedPercent={used} pacePercent={pace} isZh={isZh}
         label={`${tierLabel(tier.name, isZh)} ${isZh ? "已用额度" : "used quota"}`} />
       <span className={`w-10 shrink-0 text-right font-semibold tabular-nums ${utilizationColor(used)}`}>
@@ -102,7 +108,11 @@ function SpendRow({ spend, isZh }: { spend: ProviderUsageSpend; isZh: boolean })
         ? isZh
           ? "本月"
           : "Month"
-        : spend.name;
+        : spend.name === "total"
+          ? isZh
+            ? "累计"
+            : "Total"
+          : spend.name;
   return (
     <div className="flex items-center justify-between gap-3 text-xs">
       <span className="w-14 shrink-0 font-medium text-slate-500">{label}</span>
@@ -416,7 +426,7 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
   // Until they are configured the footer stays hidden — no error banner.
   const localKind = localUsageKind(provider);
   const localUsage = localKind !== null;
-  const isArk = !localUsage && isArkProvider(provider);
+  const isArk = !localUsage && !relaysSub2Api(provider) && isArkProvider(provider);
   const { data: arkCredentials } = useQuery<ProviderUsageCredentials | null>({
     ...arkCredentialsQuery(provider),
     enabled: isArk,
@@ -439,11 +449,16 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
     return null;
   }
 
+  // A Sub2API relay without `/v1/usage` (older deployments) falls back to
+  // retained-log accounting at query time; render whichever view arrived.
+  const localView = localKind
+    ?? (relaysSub2Api(provider) && usage?.kind === "sub2api" ? "sub2api" : null);
   // Never render a cached report from the other accounting mode.
-  const shown = (localUsage ? usage?.kind === localKind : !isLocalUsageKind(usage?.kind)) ? usage : undefined;
+  const shown = (localView ? usage?.kind === localView : !isLocalUsageKind(usage?.kind)) ? usage : undefined;
   const balances = shown?.balances ?? [];
-  const hasBuckets = !localUsage && hasStructuredQuotaBuckets(shown);
-  const pause = localUsage || hasBuckets ? null : providerUsagePause(shown, isZh);
+  const hasBuckets = !localView && hasStructuredQuotaBuckets(shown);
+  const staleSub2Api = Boolean(error && shown?.kind === "sub2api_key");
+  const pause = localView || hasBuckets || staleSub2Api ? null : providerUsagePause(shown, isZh);
   const quotaCountdown = countdownStr(pause?.resetAt);
   const blockedTierLabels = (pause?.quotaExhausted ? shown?.scheduling?.blocking_tiers ?? [] : [])
     .map((name) => tierLabel(name, isZh))
@@ -459,7 +474,7 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
     !pause &&
     (shown?.tiers ?? []).some((tier) => tier.used_percent >= 100) &&
     balances.some((balance) => balance.total > 0);
-  const title = providerUsageTitle(localKind ?? shown?.kind, isZh);
+  const title = providerUsageTitle(localView ?? shown?.kind, isZh);
   const errorMessage = error ? localizeBackendErrorMessage(error, isZh) : "";
 
   const claudeSingleton = (shown?.kind === "claude_code_plan" || Boolean(currentClaudeAccount)) && !shown?.account_pool?.config;
@@ -488,6 +503,9 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
           <span>{title}</span>
           {hasBuckets && <QuotaBucketAvailability buckets={shown!.quota_buckets!} stale={Boolean(error)} isZh={isZh} now={now}
             expectedCount={expectedQuotaPools(provider, shown)} owner={shown} />}
+          {shown?.sub2api_quota?.expires_at && (
+            <span>{isZh ? "到期" : "Expires"} {new Date(shown.sub2api_quota.expires_at).toLocaleString(locale)}</span>
+          )}
           {shown?.level && (
             <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600">
               {shown.level}
@@ -563,13 +581,13 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
         </div>
       )}
 
-      {!localUsage && !hasBuckets && shown?.is_available === false && !pause && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
+      {!localView && !hasBuckets && !staleSub2Api && shown?.is_available === false && !pause && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
       {error && <div role="alert" className="flex items-center gap-1.5 text-xs text-red-500" title={errorMessage}>
         <AlertCircle className="h-3.5 w-3.5 shrink-0" />
         <span className="break-words">{isZh ? "用量查询失败" : "Usage query failed"}: {errorMessage}</span>
       </div>}
-      {localKind ? (
-        <LocalUsageSummary kind={localKind} stats={shown?.api_price} now={now} loading={isFetching} locale={locale} />
+      {localView ? (
+        <LocalUsageSummary kind={localView} stats={shown?.api_price} now={now} loading={isFetching} locale={locale} />
       ) : hasBuckets && shown ? (
         <ProviderQuotaBuckets usage={shown} now={now} stale={Boolean(error)} loading={isFetching} locale={locale} onDetails={setDetailFilter} />
       ) : shown?.upstream ? (
@@ -585,7 +603,7 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
           {shown.tiers
             .filter((tier) => shown.kind !== "kiro_plan" || !tier.name.startsWith("feature:kiro:"))
             .map((tier) => (
-              <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />
+              <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} amount={shown.sub2api_quota?.amounts[tier.name]} />
             ))}
           {/* Windows and balances render together: Devin's extra balance sits
               under its daily/weekly bars and decides whether a spent window
@@ -608,8 +626,11 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
       ) : (
         <p className="text-xs text-slate-400">{isZh ? "暂无用量数据" : "No usage data"}</p>
       )}
-      {!localUsage && !hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
+      {!localView && !hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
         usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
+      {/* Sub2API bills the key itself; the retained-log totals stay underneath. */}
+      {shown?.kind === "sub2api_key" && <LocalUsageSummary kind="sub2api" stats={shown.api_price} now={now}
+        loading={isFetching} locale={locale} />}
       {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={(shown?.quota_buckets ?? []).filter((bucket) => !isForwardedRouteBucket(bucket) && !isGoogleFamilyDisplayBucket(bucket))}
         open onOpenChange={setBindingEditorOpen} />}
       {detailFilter && <ProviderUsageDialog open onOpenChange={(open) => { if (!open) setDetailFilter(null); }}

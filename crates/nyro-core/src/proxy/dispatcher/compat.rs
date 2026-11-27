@@ -642,12 +642,17 @@ async fn handle_buffered_compat(
                 &body,
             )
             .is_some();
-        let health_outcome = if entitlement {
+        let parsed_body = serde_json::from_slice::<Value>(&body).ok();
+        // Sub2API pre-execution refusals: provider-scoped, health-neutral.
+        let sub2api = parsed_body.as_ref().and_then(|body| {
+            crate::provider::sub2api::errors::rejection(call_ctx.provider, metadata.status, body)
+        });
+        let log = log.note(sub2api.map(|rejection| rejection.hint()));
+        let health_outcome = if entitlement || sub2api.is_some() {
             HealthOutcome::Neutral
         } else {
             health_outcome_from_status(metadata.status)
         };
-        let parsed_body = serde_json::from_slice::<Value>(&body).ok();
         let refusal = parsed_body.as_ref().and_then(|body| {
             crate::provider::anthropic::claude_code::errors::account_refusal(metadata.status, body)
         });
@@ -663,6 +668,9 @@ async fn handle_buffered_compat(
             }
             if entitlement {
                 response.extensions_mut().insert(super::EntitlementRefusal);
+            }
+            if let Some(rejection) = sub2api {
+                response.extensions_mut().insert(rejection);
             }
             response
         };
@@ -696,6 +704,16 @@ async fn handle_buffered_compat(
                 health: health_outcome,
             };
         }
+        log.status(metadata.status)
+            .with_upstream_request(upstream_req_headers, upstream_req_body)
+            .with_upstream_response(
+                raw.status as i32,
+                upstream_headers,
+                upstream_body.clone(),
+                Some(upstream_latency_ms),
+            )
+            .resp_body(upstream_body)
+            .emit();
         return CompatAttempt {
             response: tag(build_compat_response(metadata, Body::from(body))),
             retry: RetryDisposition::DefaultStatusPolicy,

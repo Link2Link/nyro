@@ -77,6 +77,14 @@ struct ProviderQuotaState {
     on_reserve: bool,
     next_check: Instant,
     consecutive_failures: u32,
+    /// Sub2API enforces rolling limits upstream. A known reset releases the local gate.
+    release_at: Option<DateTime<Utc>>,
+}
+
+impl ProviderQuotaState {
+    fn reset_has_elapsed(&self) -> bool {
+        self.release_at.is_some_and(|reset| Utc::now() >= reset)
+    }
 }
 
 pub struct ProviderQuotaRegistry {
@@ -380,6 +388,7 @@ impl ProviderQuotaRegistry {
                 on_reserve: false,
                 next_check: Instant::now() + delay,
                 consecutive_failures: 0,
+                release_at: None,
             },
         );
         (effective, summary)
@@ -685,6 +694,7 @@ impl ProviderQuotaRegistry {
                 on_reserve: false,
                 next_check: Instant::now(),
                 consecutive_failures: 0,
+                release_at: None,
             },
         );
         drop(scoped);
@@ -781,7 +791,10 @@ impl ProviderQuotaRegistry {
             .read()
             .unwrap()
             .get(provider_id)
-            .map(|state| state.scheduling.status == ProviderSchedulingStatus::Eligible)
+            .map(|state| {
+                state.scheduling.status == ProviderSchedulingStatus::Eligible
+                    || state.reset_has_elapsed()
+            })
             .unwrap_or(true)
     }
 
@@ -790,7 +803,16 @@ impl ProviderQuotaRegistry {
             .read()
             .unwrap()
             .get(provider_id)
-            .map(|state| state.scheduling.clone())
+            .map(|state| {
+                if state.reset_has_elapsed() {
+                    ProviderScheduling {
+                        next_check_at: state.scheduling.next_check_at.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    state.scheduling.clone()
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -811,6 +833,7 @@ impl ProviderQuotaRegistry {
             .read()
             .unwrap()
             .get(provider_id)
+            .filter(|state| !state.reset_has_elapsed())
             .map(|state| state.tiers.clone())
             .unwrap_or_default()
     }
@@ -851,6 +874,7 @@ impl ProviderQuotaRegistry {
                 on_reserve: schedulable && on_reserve,
                 next_check,
                 consecutive_failures: 0,
+                release_at: None,
             },
         );
         scheduling
@@ -884,10 +908,38 @@ impl ProviderQuotaRegistry {
         is_available: Option<bool>,
         reserve_available: bool,
     ) -> ProviderScheduling {
+        self.observe_windows(provider_id, tiers, is_available, reserve_available, false)
+    }
+
+    pub(crate) fn observe_sub2api(
+        &self,
+        provider_id: &str,
+        tiers: &[QuotaTierObservation],
+        is_available: Option<bool>,
+    ) -> ProviderScheduling {
+        self.observe_windows(provider_id, tiers, is_available, false, true)
+    }
+
+    fn observe_windows(
+        &self,
+        provider_id: &str,
+        tiers: &[QuotaTierObservation],
+        is_available: Option<bool>,
+        reserve_available: bool,
+        release_on_reset: bool,
+    ) -> ProviderScheduling {
         let now = Utc::now();
         let blocking = tiers
             .iter()
             .filter(|tier| tier.used_percent >= 100.0)
+            .filter(|tier| {
+                !release_on_reset
+                    || tier
+                        .resets_at
+                        .as_deref()
+                        .and_then(parse_reset_at)
+                        .is_none_or(|reset| reset > now)
+            })
             .collect::<Vec<_>>();
         let account_unavailable = is_available == Some(false);
         let on_reserve = reserve_available && !account_unavailable && !blocking.is_empty();
@@ -903,6 +955,11 @@ impl ProviderQuotaRegistry {
             .and_then(|resets| resets.into_iter().max())
             .map(|reset| reset.to_rfc3339());
 
+        let release_at = if release_on_reset && !account_unavailable {
+            reset_at.as_deref().and_then(parse_reset_at)
+        } else {
+            None
+        };
         let delay = if on_reserve {
             RESERVE_REFRESH_INTERVAL
         } else if !exhausted {
@@ -950,6 +1007,7 @@ impl ProviderQuotaRegistry {
                 on_reserve,
                 next_check: Instant::now() + delay,
                 consecutive_failures: 0,
+                release_at,
             },
         );
         drop(states);
@@ -973,6 +1031,16 @@ impl ProviderQuotaRegistry {
     }
 
     pub fn record_query_failure(&self, provider_id: &str) -> ProviderScheduling {
+        self.query_failure(provider_id, false)
+    }
+
+    /// Sub2API enforces its own quota at request time. If the usage API is
+    /// unavailable, allow traffic while backing off the next poll.
+    pub(crate) fn record_sub2api_query_failure(&self, provider_id: &str) -> ProviderScheduling {
+        self.query_failure(provider_id, true)
+    }
+
+    fn query_failure(&self, provider_id: &str, fail_open: bool) -> ProviderScheduling {
         if let Some(scoped) = self.scoped.write().unwrap().get_mut(provider_id) {
             for bucket in &mut scoped.buckets {
                 bucket.stale = true;
@@ -987,7 +1055,14 @@ impl ProviderQuotaRegistry {
                 on_reserve: false,
                 next_check: Instant::now(),
                 consecutive_failures: 0,
+                release_at: None,
             });
+        if fail_open {
+            state.release_at = None;
+            state.scheduling = ProviderScheduling::default();
+            state.tiers.clear();
+            state.on_reserve = false;
+        }
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         let multiplier = 1_u64 << state.consecutive_failures.saturating_sub(1).min(2);
         let delay = Duration::from_secs(60 * multiplier).min(MAX_FAILURE_BACKOFF);
@@ -1015,6 +1090,7 @@ impl ProviderQuotaRegistry {
                 on_reserve: false,
                 next_check: Instant::now(),
                 consecutive_failures: 0,
+                release_at: None,
             });
         state.next_check = Instant::now();
         state.scheduling.next_check_at = Some(Utc::now().to_rfc3339());
@@ -1779,6 +1855,41 @@ mod tests {
             used_percent,
             resets_at: resets_at.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn sub2api_admits_after_the_last_window_reset() {
+        let registry = ProviderQuotaRegistry::new();
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        registry.observe_sub2api("key", &[tier("daily", 100.0, Some(&future))], Some(true));
+        assert!(!registry.is_schedulable("key"));
+        // Advance only the admission deadline. The upstream snapshot still
+        // reports 100%, and no refresh has run since the observation.
+        registry
+            .states
+            .write()
+            .unwrap()
+            .get_mut("key")
+            .unwrap()
+            .release_at = Some(Utc::now());
+        assert!(registry.is_model_schedulable("key", "gemini"));
+        assert_eq!(
+            registry.model_scheduling("key", "gemini").status,
+            ProviderSchedulingStatus::Eligible
+        );
+        assert!(registry.model_tiers("key", "gemini").is_empty());
+        registry.observe_sub2api(
+            "key",
+            &[
+                tier("daily", 100.0, Some(&future)),
+                tier("key_quota", 100.0, None),
+            ],
+            Some(true),
+        );
+        assert!(registry.states.read().unwrap()["key"].release_at.is_none());
+        registry.observe_sub2api("key", &[tier("daily", 100.0, Some(&future))], Some(false));
+        assert!(!registry.is_schedulable("key"));
+        assert!(registry.states.read().unwrap()["key"].release_at.is_none());
     }
 
     #[test]

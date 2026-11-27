@@ -212,6 +212,16 @@ impl LogDiagnostic {
         self.error_message = Some(public_message(kind).to_string());
         self.error_causes = vec![sanitize_cause(message)];
     }
+    /// Append a supplementary cause (an operator hint about an already
+    /// recorded failure) without changing the outcome, kind or stage.
+    /// Duplicates are skipped and the cause list stays bounded.
+    pub fn add_cause(&mut self, message: &str) {
+        let cause = sanitize_cause(message);
+        if cause.is_empty() || self.error_causes.contains(&cause) || self.error_causes.len() >= 8 {
+            return;
+        }
+        self.error_causes.push(cause);
+    }
     pub fn record_failure(
         &mut self,
         outcome: &str,

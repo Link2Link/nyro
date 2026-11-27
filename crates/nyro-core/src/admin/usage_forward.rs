@@ -54,6 +54,7 @@ impl UsageSnapshotCache {
         // This cache serves proxy forwarding, not admin statistics. Never retain
         // local log prices here, even if an enriched admin snapshot is supplied.
         usage.api_price = None;
+        usage.sub2api_quota = None;
         usage.account_pool = None;
         usage.upstream = None;
         for bucket in &mut usage.quota_buckets {
@@ -400,6 +401,14 @@ impl AdminService {
                     }
                 }
                 (rows, states)
+            }
+            // A relay without Sub2API's usage endpoint has no upstream view.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::provider::sub2api::usage::UsageUnsupported>()
+                    .is_some() =>
+            {
+                (vec![entry], unknown())
             }
             Err(error) => {
                 tracing::warn!(%error, provider_id = %provider.id, "usage forwarding query failed");
@@ -807,6 +816,7 @@ mod tests {
             api_price: None,
             account_pool: None,
             pool_quota: None,
+            sub2api_quota: None,
             upstream: Some(serde_json::json!({"providers": []})),
             quota_buckets: Vec::new(),
         }

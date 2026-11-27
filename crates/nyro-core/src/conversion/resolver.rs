@@ -124,18 +124,6 @@ pub(crate) fn resolve_conversion(
     })
 }
 
-/// ChatGPT 消费级 Responses 上游渠道：codex OAuth 直连与 sub2api 中转。
-/// sub2api 转发的仍是同一 chatgpt.com/backend-api/codex 消费级后端，
-/// 出站体改写契约（参数剥离 / store / include / 强制流式）对两者一致。
-fn is_codex_consumer_channel(channel: &str) -> bool {
-    channel.eq_ignore_ascii_case("codex") || channel.eq_ignore_ascii_case("sub2api")
-}
-
-/// 消费级契约的完整判定：vendor 须为 openai 预设（codex / sub2api 渠道）。
-fn is_codex_consumer_vendor(vendor_id: &str, channel: &str) -> bool {
-    vendor_id.eq_ignore_ascii_case("openai") && is_codex_consumer_channel(channel)
-}
-
 /// Raw-wire compatibility only understands registered JSON/HTTP codecs.
 /// Vendor-owned binary streams must be dispatched by their executor instead.
 fn json_http_pair(ingress: ProtocolId, egress: ProtocolId) -> bool {
@@ -154,36 +142,25 @@ pub(crate) fn supports_raw_wire_compat(
     egress_base_url: &str,
     actual_model: &str,
 ) -> bool {
-    if !json_http_pair(ingress, egress) || crate::provider::nyro_gateway::is_nyro_gateway(provider)
+    if !json_http_pair(ingress, egress) || crate::provider::dialect::is_transparent_relay(provider)
     {
-        // A Nyro relay is not a third-party model backend. In particular,
+        // A relay that still picks the vendor (a chained Nyro, a Sub2API
+        // Composite group) is not a third-party model backend. In particular,
         // Responses-Lite tools and opaque replay state belong to the remote;
         // normalizing them here loses information before it can choose a vendor.
         return false;
     }
-    let vendor_id = provider
-        .vendor
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default();
-    let channel = provider
-        .channel
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default();
     // google subscription channels (antigravity + gemini-cli, Code Assist
     // v1internal) rewrap the wire envelope through vendor hooks and unwrap
     // every SSE line on the way back; the raw-wire compat path bypasses
     // those response hooks, so force the channel onto the IR pipeline which
-    // applies them.
-    if vendor_id.eq_ignore_ascii_case("google")
-        && (channel.eq_ignore_ascii_case("antigravity")
-            || channel.eq_ignore_ascii_case("gemini-cli"))
-    {
+    // applies them. Identity check: Sub2API platforms share channel names.
+    if crate::provider::google::is_subscription_channel(provider) {
         return false;
     }
-    let openai_native =
-        vendor_id.eq_ignore_ascii_case("openai") || is_codex_consumer_channel(channel);
+    // Wire dialect of the final hop (a Sub2API platform names its upstream).
+    let vendor_id = crate::provider::dialect::wire_dialect_vendor(provider);
+    let openai_native = crate::provider::dialect::is_openai_native_responses(provider);
 
     matches!(
         (ingress, egress),
@@ -229,18 +206,14 @@ pub(crate) fn resolve_raw_wire_compat(
         current_request,
     } = input;
 
-    if !json_http_pair(ingress, egress) || crate::provider::nyro_gateway::is_nyro_gateway(provider)
+    if !json_http_pair(ingress, egress) || crate::provider::dialect::is_transparent_relay(provider)
     {
         return Ok(None);
     }
 
-    let vendor_id = provider
-        .vendor
-        .as_deref()
-        .map(str::trim)
+    let vendor_id = Some(crate::provider::dialect::wire_dialect_vendor(provider))
         .filter(|value| !value.is_empty())
         .unwrap_or("custom");
-    let channel = provider.channel.as_deref().unwrap_or_default().trim();
 
     let mut context_1m = false;
     let mut upstream_model = actual_model;
@@ -258,7 +231,7 @@ pub(crate) fn resolve_raw_wire_compat(
             // sub2api 中转与 codex 直连同契约：统一 CodexOAuthResponses
             // （store=false / include reasoning.encrypted_content / 剥离
             // 采样参数 / 强制流式，见 transform_responses 的契约分支）。
-            let flavor = if is_codex_consumer_vendor(vendor_id, channel) {
+            let flavor = if crate::provider::dialect::is_openai_codex_consumer(provider) {
                 UpstreamFlavor::CodexOAuthResponses
             } else if vendor_id.eq_ignore_ascii_case("xai") {
                 UpstreamFlavor::XaiStrictResponses
@@ -269,7 +242,7 @@ pub(crate) fn resolve_raw_wire_compat(
             profile.service_tier_override =
                 crate::provider::common::pipeline::openai_service_tier_override(
                     provider.fast_mode,
-                    Some(channel),
+                    crate::provider::dialect::is_codex_consumer(provider),
                     egress.protocol,
                 );
             profile

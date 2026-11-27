@@ -4,6 +4,22 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.58
+
+> Released on 2026-11-27
+
+#### Features
+
+- **Sub2API provider**. Choose one of 13 group platforms and enter the relay address and API key. Nyro configures the protocol endpoints, including the dedicated Antigravity routes for Claude and Gemini. The provider form can suggest a platform from the key's model catalog and group information and asks for confirmation if the selection differs. Existing OpenAI Sub2API channels remain usable.
+- **Upstream quota and billing**. Single-key providers read the key's quota, rolling limits, subscription windows, wallet balance and spend from Sub2API. A full window pauses routing until its reported reset. A failed quota check leaves routing eligible. Key pools and relays without a usage endpoint retain local usage statistics.
+- **Failover and diagnostics**. When Sub2API rejects a request before execution for billing or group policy, Nyro tries the next route target and keeps the provider healthy. Billing rejections trigger a quota refresh. Logs and model probes explain Claude Code restrictions, disabled Messages dispatch, platform mismatches and model allowlist failures.
+
+#### Fixes
+
+- Gemini model probes now preserve the SSE query parameter when adding an API key and honor the relay's Bearer authentication.
+
+---
+
 ## v2.1.57
 
 > Released on 2026-11-27

@@ -18,6 +18,7 @@
 
 pub(crate) mod account_pool;
 pub mod common;
+pub(crate) mod dialect;
 pub mod inbound;
 pub mod key_pool;
 pub mod metadata;
@@ -45,6 +46,7 @@ pub mod ollama;
 pub mod openai;
 pub mod opencode_go;
 pub mod openrouter;
+pub mod sub2api;
 pub mod vertexai;
 pub mod xai;
 pub mod xiaomimimo;

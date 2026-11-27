@@ -231,6 +231,9 @@ pub struct ProviderUsage {
     /// quota observations; safe to forward without the admin-only account list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_quota: Option<crate::provider::nyro_gateway::usage::pool_quota::AnonymousPoolQuota>,
+    /// Monetary limits read with this provider's Sub2API key. Admin display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub2api_quota: Option<crate::provider::sub2api::usage::QuotaDetails>,
     /// Nyro preset only: the remote Nyro's forwarded usage report
     /// (`GET /v1/nyro/usage`), passed through as received.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -348,6 +351,16 @@ enum UsageBackend {
     /// Claude subscription (Pro/Max) via the Claude Code OAuth channel:
     /// session / weekly windows from `GET /api/oauth/usage`.
     ClaudeCode,
+    /// Sub2API relay (preset or legacy channel): the key's own quota, rolling
+    /// windows, subscription limits or wallet balance from `GET /v1/usage`.
+    Sub2Api,
+}
+
+/// A Sub2API relay reads upstream quota only when one key speaks for the
+/// whole provider: a usable provider key and no key pool (pooled keys carry
+/// independent quotas). Otherwise its usage stays local accounting.
+fn sub2api_upstream_usage(provider: &Provider) -> bool {
+    !provider.has_key_pool() && usage_api_key(provider).is_some()
 }
 
 /// Keep per-attempt service-tier capture aligned with the Codex usage card,
@@ -372,12 +385,11 @@ impl LocalUsageAccounting {
         if crate::provider::nyro_gateway::is_nyro_gateway(provider) {
             return None;
         }
-        if provider
-            .channel
-            .as_deref()
-            .is_some_and(|channel| channel.trim().eq_ignore_ascii_case("sub2api"))
-        {
-            return Some(Self::Sub2Api);
+        // The Sub2API preset (any platform) and the legacy OpenAI-preset
+        // `sub2api` channel follow identity, never the URL or name. Local
+        // accounting covers relays whose quota cannot be read upstream.
+        if crate::provider::sub2api::errors::relays_sub2api(provider) {
+            return (!sub2api_upstream_usage(provider)).then_some(Self::Sub2Api);
         }
         // A vendor quota backend selected by the Base URL (for example an
         // Anthropic-compatible GLM or Kimi endpoint) keeps its upstream view.
@@ -422,6 +434,12 @@ impl UsageBackend {
         // A chained Nyro is recognised by identity only: its address is any host.
         if crate::provider::nyro_gateway::is_nyro_gateway(provider) {
             return Some(UsageBackend::NyroGateway);
+        }
+        // A Sub2API relay (preset or legacy channel) is any host too: URL
+        // matching below (`z.ai`, `api.kimi.com`, ...) must never send its
+        // key to a vendor quota API. Its quota comes from Sub2API itself.
+        if crate::provider::sub2api::errors::relays_sub2api(provider) {
+            return sub2api_upstream_usage(provider).then_some(UsageBackend::Sub2Api);
         }
         let is_codex_channel = provider
             .channel
@@ -568,6 +586,7 @@ impl UsageBackend {
             UsageBackend::Kiro => "kiro_plan",
             UsageBackend::NyroGateway => "nyro_gateway",
             UsageBackend::ClaudeCode => "claude_code_plan",
+            UsageBackend::Sub2Api => "sub2api_key",
         }
     }
 
@@ -587,6 +606,8 @@ impl UsageBackend {
             UsageBackend::Kiro => tiers.iter().any(|tier| !tier.name.starts_with("feature:")),
             // A parsed report is authoritative even when it lists no provider.
             UsageBackend::NyroGateway => true,
+            // An unlimited subscription has no windows but a known state.
+            UsageBackend::Sub2Api => is_available.is_some() || !tiers.is_empty(),
             _ => !tiers.is_empty(),
         }
     }
@@ -607,6 +628,7 @@ impl UsageBackend {
             | UsageBackend::Kiro
             | UsageBackend::NyroGateway
             | UsageBackend::ClaudeCode
+            | UsageBackend::Sub2Api
             | UsageBackend::GoogleSubscription => "global",
             UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
             // The MiMo console quota surface is account-scoped; the
@@ -2822,33 +2844,41 @@ impl AdminService {
     pub async fn get_provider_usage(&self, id: &str) -> anyhow::Result<ProviderUsage> {
         let provider = self.get_provider(id).await?;
         if let Some(local) = LocalUsageAccounting::detect(&provider) {
-            // Do not refresh quotas or publish this local report to the
-            // snapshot cache used by forwarding.
-            let now = Utc::now();
-            let provider_id = provider.id.clone();
-            let api_price = self.local_api_price_stats(provider, now).await?;
-            return Ok(ProviderUsage {
-                provider_id,
-                kind: local.kind().into(),
-                site: "local".into(),
-                level: None,
-                tiers: Vec::new(),
-                quota_buckets: Vec::new(),
-                balances: Vec::new(),
-                spends: Vec::new(),
-                is_available: None,
-                scheduling: ProviderScheduling::default(),
-                queried_at: now.to_rfc3339(),
-                api_price: Some(api_price),
-                account_pool: None,
-                pool_quota: None,
-                upstream: None,
-            });
+            return self.local_usage_report(provider, local).await;
         }
-        let mut usage = self.provider_usage_snapshot(id).await?;
-        // Price enrichment belongs only to this admin path, never GuardOnly or
-        // proxy forwarding; failures cannot alter a successful quota observation.
-        self.enrich_provider_api_price(&mut usage).await;
+        let mut usage = match self.provider_usage_snapshot(id).await {
+            Ok(usage) => usage,
+            // An address without Sub2API's usage endpoint keeps the local view.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::provider::sub2api::usage::UsageUnsupported>()
+                    .is_some() =>
+            {
+                return self
+                    .local_usage_report(provider, LocalUsageAccounting::Sub2Api)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        if usage.kind == UsageBackend::Sub2Api.kind() {
+            // Sub2API reports its own billing; the retained-log API prices stay
+            // the same local calendar-month view as the fallback card.
+            match self
+                .local_api_price_stats(provider.clone(), Utc::now())
+                .await
+            {
+                Ok(stats) => usage.api_price = Some(stats),
+                Err(error) => tracing::warn!(
+                    provider_id = %usage.provider_id,
+                    %error,
+                    "could not compute Sub2API retained-log API price statistics"
+                ),
+            }
+        } else {
+            // Price enrichment belongs only to this admin path, never GuardOnly or
+            // proxy forwarding; failures cannot alter a successful quota observation.
+            self.enrich_provider_api_price(&mut usage).await;
+        }
         // Presentation only: caches, admission, persistent fences and immutable
         // attempt attribution keep the exact discovered resource identities.
         if usage.kind == UsageBackend::GoogleSubscription.kind() {
@@ -2858,6 +2888,36 @@ impl AdminService {
             );
         }
         Ok(usage)
+    }
+
+    /// Retained-log report for providers without an upstream quota view. It
+    /// neither refreshes quotas nor publishes to the forwarding snapshot cache.
+    async fn local_usage_report(
+        &self,
+        provider: Provider,
+        local: LocalUsageAccounting,
+    ) -> anyhow::Result<ProviderUsage> {
+        let now = Utc::now();
+        let provider_id = provider.id.clone();
+        let api_price = self.local_api_price_stats(provider, now).await?;
+        Ok(ProviderUsage {
+            provider_id,
+            kind: local.kind().into(),
+            site: "local".into(),
+            level: None,
+            tiers: Vec::new(),
+            quota_buckets: Vec::new(),
+            balances: Vec::new(),
+            spends: Vec::new(),
+            is_available: None,
+            scheduling: ProviderScheduling::default(),
+            queried_at: now.to_rfc3339(),
+            api_price: Some(api_price),
+            account_pool: None,
+            pool_quota: None,
+            sub2api_quota: None,
+            upstream: None,
+        })
     }
 
     /// Full vendor snapshot for forwarding without local admin-only log pricing.
@@ -2965,6 +3025,14 @@ impl AdminService {
             return Ok(self.account_pool_provider_usage(view));
         }
         let fence = self.gw.quota_registry.bucket_refresh_fence(id);
+        let on_failure = || {
+            if UsageBackend::detect(&provider) == Some(UsageBackend::Sub2Api) {
+                self.gw.usage_snapshots.invalidate(id);
+                self.gw.quota_registry.record_sub2api_query_failure(id)
+            } else {
+                self.gw.quota_registry.record_query_failure(id)
+            }
+        };
         match self.query_provider_usage(id, mode).await {
             Ok((mut usage, _, _))
                 if usage.kind == UsageBackend::GoogleSubscription.kind()
@@ -3032,12 +3100,18 @@ impl AdminService {
                 // extra-usage balance is left to carry the traffic.
                 let reserve_available = devin_reserve_available(&usage.kind, &usage.balances)
                     || (usage.kind == UsageBackend::Kiro.kind() && kiro_overage);
-                usage.scheduling = self.gw.quota_registry.observe_with_reserve(
-                    &usage.provider_id,
-                    &tiers,
-                    usage.is_available,
-                    reserve_available,
-                );
+                usage.scheduling = if usage.kind == UsageBackend::Sub2Api.kind() {
+                    self.gw
+                        .quota_registry
+                        .observe_sub2api(id, &tiers, usage.is_available)
+                } else {
+                    self.gw.quota_registry.observe_with_reserve(
+                        id,
+                        &tiers,
+                        usage.is_available,
+                        reserve_available,
+                    )
+                };
                 Ok(usage)
             }
             Ok((mut usage, false, _)) => {
@@ -3046,11 +3120,11 @@ impl AdminService {
                     kind = %usage.kind,
                     "provider usage response did not contain an authoritative quota observation"
                 );
-                usage.scheduling = self.gw.quota_registry.record_query_failure(id);
+                usage.scheduling = on_failure();
                 Ok(usage)
             }
             Err(error) => {
-                self.gw.quota_registry.record_query_failure(id);
+                on_failure();
                 Err(error)
             }
         }
@@ -3094,9 +3168,71 @@ impl AdminService {
         };
 
         let mut kiro_overage = false;
+        let mut sub2api_quota = None;
         let mut upstream = None;
         let mut quota_buckets = Vec::new();
         let (mut tiers, balances, level, is_available, spends) = match backend {
+            UsageBackend::Sub2Api => {
+                let api_key = api_key.as_deref().expect("non-OAuth backend API key");
+                let base_url = [provider.base_url.as_str()]
+                    .into_iter()
+                    .chain(
+                        provider
+                            .protocol_endpoints
+                            .iter()
+                            .filter(|endpoint| endpoint.is_enabled)
+                            .map(|endpoint| endpoint.base_url.as_str()),
+                    )
+                    .map(str::trim)
+                    .find(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("the Sub2API provider has no address"))?;
+                let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                let body = crate::provider::sub2api::usage::fetch_usage(
+                    &client, base_url, api_key, &today,
+                )
+                .await?;
+                let report = crate::provider::sub2api::usage::parse_usage(&body)?;
+                if mode == UsageQueryMode::Full {
+                    sub2api_quota = Some(crate::provider::sub2api::usage::QuotaDetails {
+                        amounts: report
+                            .windows
+                            .iter()
+                            .map(|w| (w.name, w.amount.clone()))
+                            .collect(),
+                        expires_at: report.expires_at.clone(),
+                    });
+                }
+                let tiers = report
+                    .windows
+                    .into_iter()
+                    .map(|window| ProviderUsageTier {
+                        name: window.name.to_string(),
+                        used_percent: window.used_percent,
+                        resets_at: window.resets_at,
+                    })
+                    .collect();
+                let balances = report
+                    .balance_usd
+                    .map(|total| ProviderUsageBalance {
+                        currency: "USD".into(),
+                        total,
+                        granted: 0.0,
+                        topped_up: total,
+                    })
+                    .into_iter()
+                    .collect();
+                let spends = report
+                    .spends
+                    .into_iter()
+                    .map(|(name, amount)| ProviderUsageSpend {
+                        name: name.into(),
+                        amount,
+                        currency: "USD".into(),
+                    })
+                    .collect();
+                (tiers, balances, report.level, report.is_available, spends)
+            }
             UsageBackend::NyroGateway => {
                 let api_key = api_key.as_deref().expect("non-OAuth backend API key");
                 let base_url = [provider.base_url.as_str()]
@@ -3839,6 +3975,7 @@ impl AdminService {
                 api_price: None,
                 account_pool: None,
                 pool_quota: None,
+                sub2api_quota,
                 upstream,
             },
             authoritative,
@@ -5259,6 +5396,71 @@ mod tests {
     }
 
     #[test]
+    fn sub2api_usage_is_identity_first_and_upstream_when_one_key_speaks() {
+        // Hosts that would match vendor quota URLs must not leak the relay key.
+        for url in [
+            "https://api.xyz.ai/v1",
+            "https://relay.example.com/api.kimi.com",
+            "https://token-plan.example.com",
+            "https://chatgpt.com/backend-api/codex",
+        ] {
+            for (vendor, channel) in [
+                ("sub2api", "antigravity"),
+                ("sub2api", "openai"),
+                ("sub2api", "zhipu"),
+                ("sub2api", "typesafe"),
+                ("openai", "sub2api"),
+            ] {
+                let context = format!("{vendor}/{channel} @ {url}");
+                let mut provider =
+                    provider_for_usage(Some(vendor), Some(vendor), Some(channel), url);
+                // Without a usable key the relay keeps local accounting.
+                assert_eq!(UsageBackend::detect(&provider), None, "{context}");
+                assert_eq!(
+                    LocalUsageAccounting::detect(&provider),
+                    Some(LocalUsageAccounting::Sub2Api),
+                    "{context}"
+                );
+                // One provider key reads the key's own quota from Sub2API.
+                provider.api_key = "sk-relay".into();
+                provider.auth_mode = "apikey".into();
+                assert_eq!(
+                    UsageBackend::detect(&provider),
+                    Some(UsageBackend::Sub2Api),
+                    "{context}"
+                );
+                assert_eq!(LocalUsageAccounting::detect(&provider), None, "{context}");
+                // Pooled keys have independent quotas: local accounting again.
+                provider.keys.push(crate::db::models::ProviderKey {
+                    id: "k1".into(),
+                    provider_id: provider.id.clone(),
+                    name: "k1".into(),
+                    api_key: "sk-pooled".into(),
+                    protocol: None,
+                    base_url: None,
+                    is_enabled: true,
+                    priority: 0,
+                    manual_models: None,
+                    models_snapshot: None,
+                    last_probe_at: None,
+                    probe_error: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                });
+                assert_eq!(UsageBackend::detect(&provider), None, "{context}");
+                assert_eq!(
+                    LocalUsageAccounting::detect(&provider),
+                    Some(LocalUsageAccounting::Sub2Api),
+                    "{context}"
+                );
+            }
+        }
+        assert_eq!(UsageBackend::Sub2Api.kind(), "sub2api_key");
+        assert!(UsageBackend::Sub2Api.has_authoritative_observation(&[], Some(true)));
+        assert!(!UsageBackend::Sub2Api.has_authoritative_observation(&[], None));
+    }
+
+    #[test]
     fn codex_detection_prefers_structured_identity_and_keeps_url_fallback() {
         use UsageBackend::*;
         let structured = provider_for_usage(
@@ -5581,6 +5783,7 @@ mod tests {
             api_price: None,
             account_pool: None,
             pool_quota: None,
+            sub2api_quota: None,
             upstream: None,
         };
         let scheduling = usage.scheduling.clone();
@@ -6564,7 +6767,7 @@ mod tests {
                     tiers: tiers.clone(), quota_buckets: Vec::new(), balances: vec![], spends: vec![],
                     is_available: Some(true), scheduling: scheduling.clone(),
                     queried_at: now.to_rfc3339(), api_price: None,
-                    account_pool: None, pool_quota: None, upstream: None,
+                    account_pool: None, pool_quota: None, sub2api_quota: None, upstream: None,
                 };
                 let before = usage.clone();
                 let settings_before = storage.settings().list_all().await?;

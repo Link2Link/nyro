@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Check, Copy } from "lucide-react";
 import type { RequestLog, RequestLogAttempts } from "@/lib/types";
 import { outcomeLabel, parseErrorCauses, parseDevinUpstreamDiagnostic, payloadEvidence, payloadStateLabel, type PayloadField } from "@/lib/log-observability";
+import { sub2apiHintText } from "@/lib/sub2api";
 import { formatLogTime } from "@/lib/format";
 import { copyToClipboard } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -25,7 +26,7 @@ export function AttemptResultBanner({ log, correlation, correlationLoading, corr
       {log.failure_stage && <p>{isZh ? "失败阶段" : "Failure stage"}: <code>{log.failure_stage}</code></p>}
       {log.failure_kind && <p>{isZh ? "失败类型" : "Failure kind"}: <code>{log.failure_kind}</code></p>}
       {log.error_message && <p className="whitespace-pre-wrap break-all text-red-700">{log.error_message}</p>}
-      {evidence.causes.length > 0 && <div><strong>{isZh ? "原因链" : "Error causes"}</strong>{evidence.malformed && <p className="text-amber-700">{isZh ? "原因 JSON 无效；以下为原始文本。" : "Malformed causes JSON; raw text follows."}</p>}<ol className="list-decimal space-y-1 pl-5">{evidence.causes.map((cause, index) => <li key={index} className="whitespace-pre-wrap break-all">{cause}</li>)}</ol></div>}
+      {evidence.causes.length > 0 && <div><strong>{isZh ? "原因链" : "Error causes"}</strong>{evidence.malformed && <p className="text-amber-700">{isZh ? "原因 JSON 无效；以下为原始文本。" : "Malformed causes JSON; raw text follows."}</p>}<ol className="list-decimal space-y-1 pl-5">{evidence.causes.map((cause, index) => <li key={index} className="whitespace-pre-wrap break-all">{sub2apiHintText(cause, isZh)}</li>)}</ol></div>}
       {upstream.diagnostic && <div className="space-y-1 rounded border border-amber-200 bg-amber-50 p-2">
         <strong>{isZh ? "Devin 上游错误诊断（已脱敏）" : "Devin upstream error diagnostic (sanitized)"}</strong>
         <p>{isZh ? "来源" : "Source"}: {upstream.diagnostic.source === "connect_trailer" ? (isZh ? "Connect 错误结束帧" : "Connect error trailer") : (isZh ? "HTTP 错误响应" : "HTTP error response")}</p>

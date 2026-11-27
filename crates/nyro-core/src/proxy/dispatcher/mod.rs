@@ -370,6 +370,20 @@ pub(super) fn mark_upstream_error(
     }
 }
 
+/// Sub2API refused the request before any upstream account ran it (billing,
+/// group policy, platform or model mismatch). The refusal is scoped to this
+/// provider and says nothing about its health, so it stays health-neutral and
+/// the dispatcher may hand the request to the next route target.
+pub(super) fn mark_sub2api_rejection(
+    response: &mut Response,
+    rejection: Option<crate::provider::sub2api::errors::Sub2ApiRejection>,
+) {
+    if let Some(rejection) = rejection {
+        response.extensions_mut().insert(rejection);
+        response.extensions_mut().insert(LocalHealthNeutral);
+    }
+}
+
 /// A suspended Google account fails every request until an appeal succeeds:
 /// persist it as a terminal credential error so routing skips the provider
 /// instead of re-sending each request to the banned account first. The
@@ -2533,6 +2547,10 @@ async fn dispatch_pipeline_inner(
                             ctx,
                         )));
             let status = response.status().as_u16();
+            let sub2api_rejection = response
+                .extensions()
+                .get::<crate::provider::sub2api::errors::Sub2ApiRejection>()
+                .copied();
             if pool_account.is_none()
                 && crate::provider::google::is_subscription_channel(&provider)
                 && let Some(violation) = response
@@ -2588,6 +2606,17 @@ async fn dispatch_pipeline_inner(
                         &quota_owner_fence,
                     );
                 }
+                crate::admin::trigger_provider_usage_refresh(
+                    gw.clone(),
+                    target.provider_id.clone(),
+                );
+            }
+            // Sub2API billing refusals (balance, subscription, key quota) are
+            // usually 403s: re-read the key's quota so an exhausted key is
+            // paused until it recovers. 429s were refreshed just above.
+            if status != 429
+                && sub2api_rejection.is_some_and(|rejection| rejection.refreshes_usage())
+            {
                 crate::admin::trigger_provider_usage_refresh(
                     gw.clone(),
                     target.provider_id.clone(),
@@ -2717,8 +2746,25 @@ async fn dispatch_pipeline_inner(
             continue;
         }
         skip_key_siblings!();
-        if retry.should_retry(is_retryable(status)) || is_credential_rejection(status) {
-            if is_credential_rejection(status) && !retry.should_retry(is_retryable(status)) {
+        // Sub2API refused the request before any upstream account ran it, so
+        // replaying it on the next target is safe whatever the status.
+        let sub2api_rejection = response
+            .extensions()
+            .get::<crate::provider::sub2api::errors::Sub2ApiRejection>()
+            .copied();
+        if retry.should_retry(is_retryable(status))
+            || is_credential_rejection(status)
+            || sub2api_rejection.is_some()
+        {
+            if let Some(rejection) = sub2api_rejection {
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    provider_id = %provider.id,
+                    status,
+                    kind = ?rejection.kind,
+                    "Sub2API refused the request before execution; failing over to the next route target"
+                );
+            } else if is_credential_rejection(status) && !retry.should_retry(is_retryable(status)) {
                 tracing::info!(
                     request_id = %ctx.request_id,
                     provider_id = %provider.id,
@@ -3080,6 +3126,14 @@ impl LogBuilder {
     fn error(self, msg: impl Into<String>) -> Self {
         if let Some(attempt) = &self.performance {
             attempt.fail("failed", msg);
+        }
+        self
+    }
+
+    /// Attach an operator hint to the attempt's recorded failure causes.
+    fn note(self, hint: Option<&str>) -> Self {
+        if let (Some(attempt), Some(hint)) = (&self.performance, hint) {
+            attempt.with_diagnostic(|diagnostic| diagnostic.add_cause(hint));
         }
         self
     }
@@ -3888,6 +3942,27 @@ mod tests {
         let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
         mark_upstream_error(&mut response, 429, &structured, None);
         assert!(response.extensions().get::<LocalHealthNeutral>().is_none());
+    }
+
+    #[test]
+    fn sub2api_rejections_are_tagged_and_health_neutral() {
+        use super::{HealthOutcome, health_outcome_from_response, mark_sub2api_rejection};
+        use crate::provider::sub2api::errors::{RejectionKind, Sub2ApiRejection};
+        let rejection = Sub2ApiRejection {
+            kind: RejectionKind::Billing,
+        };
+        let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+        mark_sub2api_rejection(&mut response, Some(rejection));
+        assert_eq!(
+            response.extensions().get::<Sub2ApiRejection>(),
+            Some(&rejection)
+        );
+        assert!(health_outcome_from_response(&response) == HealthOutcome::Neutral);
+        // Untagged 429s keep counting against provider health.
+        let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+        mark_sub2api_rejection(&mut response, None);
+        assert!(response.extensions().get::<Sub2ApiRejection>().is_none());
+        assert!(health_outcome_from_response(&response) == HealthOutcome::Failure);
     }
 
     // ── Example PhaseHook (validates the P1 lifecycle wiring end-to-end) ──────
